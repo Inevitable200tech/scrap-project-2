@@ -1,20 +1,20 @@
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+# Official Playwright image — updated to 1.57.0
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
+# Working directory
 WORKDIR /app
 
+# Copy package files first (optimizes caching)
 COPY package*.json ./
 
-# Install ALL dependencies (dev included) so tsc can run
-RUN npm ci
+# Install production dependencies only
+RUN npm ci --omit=dev
 
-# Compile TypeScript → produces dist/
-RUN npm run build
-
-# Now remove dev dependencies to keep image lean
-RUN npm prune --omit=dev
-
+# Copy source code
 COPY . .
 
+# Expose port (Render expects this)
 EXPOSE 3000
 
-CMD ["npm", "start"]
+# Start the app with tsx directly (no build step needed)
+CMD ["npx", "tsx", "main.ts"]
