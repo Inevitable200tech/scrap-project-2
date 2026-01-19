@@ -18,7 +18,7 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STORAGE_FILE = path.join(process.cwd(), 'previous-topics.json'); // optional persistent storage
 
 // Your API endpoint (replace this!)
-const API_ENDPOINT = 'https://new-comer.onrender.com/api/scrape/'; // ← FILL THIS IN
+const API_ENDPOINT = 'https://scrap-project-1.onrender.com/api/scrape/'; // ← FILL THIS IN
 
 // ── Global state ─────────────────────────────────────────────────────────────
 let previousTopics: Set<string> = new Set(); // link + title hash
