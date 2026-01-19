@@ -158,6 +158,11 @@ async function main() {
 }
 
 main().catch(console.error);
+// Health check with debug
+app.get('/health', (req, res) => {
+  console.log('[HEALTH] Check requested');
+  res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
 
 app.listen(PORT, () => {
   console.log(`\nServer running on http://localhost:${PORT}`);
