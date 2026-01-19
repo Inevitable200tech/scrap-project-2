@@ -7,7 +7,9 @@ import * as cheerio from 'cheerio';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import axios from 'axios';
-
+import express from 'express';
+const app = express();
+const PORT = 823;
 playwrightExtra.chromium.use(StealthPlugin());
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -156,3 +158,8 @@ async function main() {
 }
 
 main().catch(console.error);
+
+app.listen(PORT, () => {
+  console.log(`\nServer running on http://localhost:${PORT}`);
+ 
+});
