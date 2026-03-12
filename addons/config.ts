@@ -42,11 +42,10 @@ export const SITES: SiteConfig[] = [
     videoLinkSelector: '.cPost_contentWrap a[href]',
     parse: async ($) => {
       const domainMap: Record<string, string[]> = {};
-
       // 1. Group links by domain
       $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
-        if (/luluvid|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
+        if (/luluvid|pixhost|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
 
         try {
           const domain = new URL(href).hostname.replace('www.', '');
