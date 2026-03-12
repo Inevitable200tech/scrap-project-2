@@ -1,27 +1,28 @@
 # Official Playwright image — updated to 1.57.0
 FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
-# Set environment to production
 ENV NODE_ENV=production
+# Disable the bloated "WEB_CONCURRENCY" logic from Render to save RAM
+ENV WEB_CONCURRENCY=1
 
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
-# 1. Install EVERYTHING (including tsx) so it's BAKED into the image
-# This prevents downloading things at runtime
-RUN npm install
+# Install only what is needed.
+# We use 'npm install' instead of 'ci' here to ensure local binaries are built.
+RUN npm install --production=false
 
-# 2. Install Playwright browsers (Chromium only to save space/RAM)
+# Install ONLY the chromium browser (Saves GBs of disk and MBs of RAM)
 RUN npx playwright install chromium
 
-# Copy source code
+# Copy the rest of the code
 COPY . .
 
-# Expose your specific port
+# Expose your port
 EXPOSE 823
 
-# 3. Execute directly from local node_modules. 
-# We avoid npx to save the memory overhead of the npm registry check.
-CMD ["./node_modules/.bin/tsx", "--expose-gc", "main.ts"]
+# Start using the absolute path to tsx to avoid npx overhead
+# Status 128 often happens if 'npx' fails to find the binary
+CMD ["./node_modules/.bin/tsx", "main.ts"]
