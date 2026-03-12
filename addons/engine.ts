@@ -8,16 +8,15 @@ import { StateManager } from './state';
 playwrightExtra.chromium.use(StealthPlugin());
 
 export async function crawlSite(site: SiteConfig, state: StateManager) {
-  // 1. Launch Browser with low-RAM optimizations
   const browser = await playwrightExtra.chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', // Uses disk instead of RAM for temporary files
+      '--disable-dev-shm-usage', 
       '--disable-accelerated-2d-canvas',
       '--no-zygote',
-      '--single-process' // Reduces overhead on restricted environments
+      '--single-process'
     ]
   });
 
@@ -25,7 +24,7 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    // 2. RAM SAVER: Block unnecessary resources
+    // RAM SAVER: Block unnecessary resources
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
       if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
@@ -36,31 +35,40 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
 
     console.log(`[INDEX] Scanning index: ${site.url}`);
     
-    // Using 'domcontentloaded' is faster and lighter than 'networkidle'
+    // Increased timeout slightly for the index page
     await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector(site.topicSelector, { timeout: 15000 }).catch(() => { });
+    await page.waitForSelector(site.topicSelector, { timeout: 20000 }).catch(() => { });
 
-    // 3. Collect Topic URLs and filter out junk
     const topicUrls: string[] = await page.$$eval(site.topicSelector, (elements) =>
       elements.map(el => (el as HTMLAnchorElement).href)
     );
 
-    // Filter out tags/profiles/etc to keep the bot on track
     const uniqueTopics = [...new Set(topicUrls)].filter(url => 
         url.includes('/topic/') && !url.includes('/tags/')
     );
 
     console.log(`[INDEX] Found ${uniqueTopics.length} valid topics. Deep-scanning...`);
 
-    // 4. Iterate through each Topic
     for (const topicUrl of uniqueTopics) {
       try {
-        console.log(`  [TOPIC] Visiting: ${topicUrl}`);
+        // Navigation with Referer to bypass simple bot checks
+        await page.goto(topicUrl, { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 30000,
+            referer: site.url 
+        });
 
-        await page.goto(topicUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // Log the Topic Title
+        const pageTitle = await page.title();
+        console.log(`  [TOPIC] Title: "${pageTitle}"`);
+        console.log(`          URL: ${topicUrl}`);
+
         const $ = cheerio.load(await page.content());
-
         const videoLinks = await site.parse($);
+
+        if (videoLinks.length === 0) {
+            console.log(`    [INFO] No valid video links found after parsing.`);
+        }
 
         for (const videoLink of videoLinks) {
           if (state.isNew(videoLink, "video_host_link")) {
@@ -75,17 +83,16 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
                 const response = await axios.post(API_ENDPOINT, {
                   url: videoLink,
                   source: site.name,
-                  parentTopic: topicUrl
+                  parentTopic: topicUrl,
+                  topicTitle: pageTitle // Sending title to your API can be useful too
                 });
 
                 if (response.status === 200 || response.status === 201) {
                   console.log(`    [SUCCESS] Delivered: ${videoLink}`);
-                  console.log(`    [RESPONSE] ${response.data.message || 'No message'}`);
                   sent = true;
                 }
               } catch (e: any) {
                 attempts++;
-                // Handle 202 or 429 as "wait and retry"
                 const isRateLimit = e.response?.status === 202 || e.response?.status === 429 || e.message.includes('try again');
 
                 if (isRateLimit && attempts < maxAttempts) {
@@ -101,10 +108,11 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
           }
         }
       } catch (topicErr: any) {
-        console.error(`  [SKIP] Timeout or Error on topic: ${topicUrl}`);
+        // Log title even on failure if possible to see where it got stuck
+        const failTitle = await page.title().catch(() => 'Unknown/Timed Out');
+        console.error(`  [SKIP] Error on "${failTitle}": ${topicErr.message}`);
       }
       
-      // Periodically clear cookies/storage to prevent bloat
       if (uniqueTopics.indexOf(topicUrl) % 5 === 0) {
           await context.clearCookies();
       }
