@@ -1,3 +1,5 @@
+//main.ts
+
 import express from 'express';
 import { SITES, CHECK_INTERVAL_MS } from './addons/config';
 import { StateManager } from './addons/state';

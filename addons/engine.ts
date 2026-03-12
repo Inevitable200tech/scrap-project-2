@@ -8,44 +8,60 @@ import { StateManager } from './state';
 playwrightExtra.chromium.use(StealthPlugin());
 
 export async function crawlSite(site: SiteConfig, state: StateManager) {
-  // 1. Launch Browser
+  // 1. Launch Browser with low-RAM optimizations
   const browser = await playwrightExtra.chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', // Uses disk instead of RAM for temporary files
+      '--disable-accelerated-2d-canvas',
+      '--no-zygote',
+      '--single-process' // Reduces overhead on restricted environments
+    ]
   });
 
   try {
-    const page = await browser.newPage();
-    console.log(`[INDEX] Scanning index: ${site.url}`);
+    const context = await browser.newContext();
+    const page = await context.newPage();
 
-    // 2. Load the Forum Index
-    await page.goto(site.url, { waitUntil: 'networkidle', timeout: 60000 });
+    // 2. RAM SAVER: Block unnecessary resources
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+        return route.abort();
+      }
+      route.continue();
+    });
+
+    console.log(`[INDEX] Scanning index: ${site.url}`);
+    
+    // Using 'domcontentloaded' is faster and lighter than 'networkidle'
+    await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector(site.topicSelector, { timeout: 15000 }).catch(() => { });
 
-    // 3. Collect Topic URLs from the grid
+    // 3. Collect Topic URLs and filter out junk
     const topicUrls: string[] = await page.$$eval(site.topicSelector, (elements) =>
       elements.map(el => (el as HTMLAnchorElement).href)
     );
 
-    const uniqueTopics = [...new Set(topicUrls)];
-    console.log(`[INDEX] Found ${uniqueTopics.length} topics. Entering deep-scan...`);
+    // Filter out tags/profiles/etc to keep the bot on track
+    const uniqueTopics = [...new Set(topicUrls)].filter(url => 
+        url.includes('/topic/') && !url.includes('/tags/')
+    );
+
+    console.log(`[INDEX] Found ${uniqueTopics.length} valid topics. Deep-scanning...`);
 
     // 4. Iterate through each Topic
     for (const topicUrl of uniqueTopics) {
       try {
         console.log(`  [TOPIC] Visiting: ${topicUrl}`);
 
-        // Navigate to the specific post
         await page.goto(topicUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        const $ = cheerio.load(await page.content());
 
-        // Load content into Cheerio for fast link extraction
-        const content = await page.content();
-        const $ = cheerio.load(content);
-
-        // Use the site-specific parser to get video host links (Streamtape, Vidara, etc.)
         const videoLinks = await site.parse($);
 
-        // 5. Send discovered Video Host links to the Scraper API
         for (const videoLink of videoLinks) {
           if (state.isNew(videoLink, "video_host_link")) {
             console.log(`    [SENDING] → ${videoLink}`);
@@ -62,36 +78,39 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
                   parentTopic: topicUrl
                 });
 
-                if (response.status === 200) {
+                if (response.status === 200 || response.status === 201) {
                   console.log(`    [SUCCESS] Delivered: ${videoLink}`);
                   sent = true;
                 }
               } catch (e: any) {
                 attempts++;
-                const isRateLimit = e.response?.status === 202 || e.message.includes('try again');
+                // Handle 202 or 429 as "wait and retry"
+                const isRateLimit = e.response?.status === 202 || e.response?.status === 429 || e.message.includes('try again');
 
                 if (isRateLimit && attempts < maxAttempts) {
-                  console.warn(`    [RATE LIMIT] Hit limit on attempt ${attempts}. Waiting 10s...`);
-                  await new Promise(r => setTimeout(r, 10000)); // 10 second wait
+                  console.warn(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`);
+                  await new Promise(r => setTimeout(r, 10000));
                 } else {
-                  console.error(`    [API ERR] Failed to send ${videoLink}: ${e.message}`);
-                  break; // Stop retrying for non-rate-limit errors or max attempts reached
+                  console.error(`    [API ERR] Failed ${videoLink}: ${e.message}`);
+                  break; 
                 }
               }
             }
-
-            // Standard gap between different links to prevent hitting the limit again immediately
-            await new Promise(r => setTimeout(r, 4000));
+            await new Promise(r => setTimeout(r, 3000)); 
           }
         }
       } catch (topicErr: any) {
-        console.error(`  [SKIP] Error processing topic ${topicUrl}: ${topicErr.message}`);
+        console.error(`  [SKIP] Timeout or Error on topic: ${topicUrl}`);
+      }
+      
+      // Periodically clear cookies/storage to prevent bloat
+      if (uniqueTopics.indexOf(topicUrl) % 5 === 0) {
+          await context.clearCookies();
       }
     }
   } catch (err: any) {
     console.error(`[CRITICAL] Engine failure: ${err.message}`);
   } finally {
-    // Ensure browser is closed to prevent RAM bloat in Docker
     await browser.close().catch(() => { });
   }
 }
