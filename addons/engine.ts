@@ -7,119 +7,137 @@ import { StateManager } from './state';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
-export async function crawlSite(site: SiteConfig, state: StateManager) {
-  const browser = await playwrightExtra.chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', 
-      '--disable-accelerated-2d-canvas',
-      '--no-zygote',
-      '--single-process'
-    ]
+const BROWSER_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--no-zygote',
+  '--single-process',
+  '--disable-gpu'
+];
+
+/**
+ * Helper to perform a single scoped navigation and return data.
+ * This ensures the browser process is killed immediately after the task.
+ */
+async function getPageData(url: string, referer?: string) {
+  const browser = await playwrightExtra.chromium.launch({ 
+    headless: true, 
+    args: BROWSER_ARGS 
   });
-
+  
   try {
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+      extraHTTPHeaders: referer ? { 'Referer': referer } : {}
+    });
     const page = await context.newPage();
-
-    // RAM SAVER: Block unnecessary resources
+    
+    // RAM SAVER: Block heavy assets
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
-        return route.abort();
-      }
-      route.continue();
+      return ['image', 'stylesheet', 'font', 'media'].includes(type) ? route.abort() : route.continue();
     });
 
-    console.log(`[INDEX] Scanning index: ${site.url}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    const content = await page.content();
+    const title = await page.title();
     
-    // Increased timeout slightly for the index page
-    await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector(site.topicSelector, { timeout: 20000 }).catch(() => { });
+    return { content, title };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
 
-    const topicUrls: string[] = await page.$$eval(site.topicSelector, (elements) =>
-      elements.map(el => (el as HTMLAnchorElement).href)
-    );
+export async function crawlSite(site: SiteConfig, state: StateManager) {
+  console.log(`[INDEX] Scanning index: ${site.url}`);
+  
+  let uniqueTopics: string[] = [];
 
-    const uniqueTopics = [...new Set(topicUrls)].filter(url => 
+  try {
+    // 1. Get the Topic List from the index
+    const indexData = await getPageData(site.url);
+    const $index = cheerio.load(indexData.content);
+    
+    const rawUrls: string[] = [];
+    $index(site.topicSelector).each((_, el) => {
+      const href = $index(el).attr('href');
+      if (href) rawUrls.push(href);
+    });
+
+    uniqueTopics = [...new Set(rawUrls)].filter(url => 
         url.includes('/topic/') && !url.includes('/tags/')
     );
 
-    console.log(`[INDEX] Found ${uniqueTopics.length} valid topics. Deep-scanning...`);
+    console.log(`[INDEX] Found ${uniqueTopics.length} topics. Processing with process isolation...`);
 
-    for (const topicUrl of uniqueTopics) {
-      try {
-        // Navigation with Referer to bypass simple bot checks
-        await page.goto(topicUrl, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 30000,
-            referer: site.url 
-        });
+  } catch (err: any) {
+    console.error(`[CRITICAL] Failed to scan index: ${err.message}`);
+    return;
+  }
 
-        // Log the Topic Title
-        const pageTitle = await page.title();
-        console.log(`  [TOPIC] Title: "${pageTitle}"`);
-        console.log(`          URL: ${topicUrl}`);
+  // 2. Iterate through each Topic with a FRESH browser instance per topic
+  for (const topicUrl of uniqueTopics) {
+    if (!state.isNew(topicUrl, "topic_visited")) continue;
 
-        const $ = cheerio.load(await page.content());
-        const videoLinks = await site.parse($);
+    try {
+      // Launch, Scrape, and Kill browser for this specific topic
+      const { content, title } = await getPageData(topicUrl, site.url);
+      console.log(`  [TOPIC] Title: "${title}"`);
 
-        if (videoLinks.length === 0) {
-            console.log(`    [INFO] No valid video links found after parsing.`);
-        }
+      const $ = cheerio.load(content);
+      const videoLinks = await site.parse($);
 
-        for (const videoLink of videoLinks) {
-          if (state.isNew(videoLink, "video_host_link")) {
-            console.log(`    [SENDING] → ${videoLink}`);
-
-            let sent = false;
-            let attempts = 0;
-            const maxAttempts = 3;
-
-            while (!sent && attempts < maxAttempts) {
-              try {
-                const response = await axios.post(API_ENDPOINT, {
-                  url: videoLink,
-                  source: site.name,
-                  parentTopic: topicUrl,
-                  topicTitle: pageTitle // Sending title to your API can be useful too
-                });
-
-                if (response.status === 200 || response.status === 201) {
-                  console.log(`    [SUCCESS] Delivered: ${videoLink}`);
-                  sent = true;
-                }
-              } catch (e: any) {
-                attempts++;
-                const isRateLimit = e.response?.status === 202 || e.response?.status === 429 || e.message.includes('try again');
-
-                if (isRateLimit && attempts < maxAttempts) {
-                  console.warn(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`);
-                  await new Promise(r => setTimeout(r, 10000));
-                } else {
-                  console.error(`    [API ERR] Failed ${videoLink}: ${e.message}`);
-                  break; 
-                }
-              }
-            }
-            await new Promise(r => setTimeout(r, 3000)); 
-          }
-        }
-      } catch (topicErr: any) {
-        // Log title even on failure if possible to see where it got stuck
-        const failTitle = await page.title().catch(() => 'Unknown/Timed Out');
-        console.error(`  [SKIP] Error on "${failTitle}": ${topicErr.message}`);
+      if (videoLinks.length === 0) {
+        console.log(`    [INFO] No valid links found.`);
       }
-      
-      if (uniqueTopics.indexOf(topicUrl) % 5 === 0) {
-          await context.clearCookies();
+
+      for (const videoLink of videoLinks) {
+        if (state.isNew(videoLink, "video_host_link")) {
+          console.log(`    [SENDING] → ${videoLink}`);
+          await sendToApiWithRetry(videoLink, site.name, topicUrl, title);
+          // Small gap to prevent API rate limits
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+    } catch (topicErr: any) {
+      console.error(`  [SKIP] Timeout or Error on topic ${topicUrl}: ${topicErr.message}`);
+    }
+  }
+}
+
+/**
+ * Robust API delivery with built-in retry for 429/202 responses
+ */
+async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl: string, title: string) {
+  let sent = false;
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  while (!sent && attempts < maxAttempts) {
+    try {
+      const response = await axios.post(API_ENDPOINT, {
+        url: videoLink,
+        source: siteName,
+        parentTopic: topicUrl,
+        topicTitle: title
+      });
+
+      if (response.status === 200 || response.status === 201) {
+        console.log(`    [SUCCESS] Delivered: ${videoLink}`);
+        sent = true;
+      }
+    } catch (e: any) {
+      attempts++;
+      const isRateLimit = e.response?.status === 202 || e.response?.status === 429 || e.message.includes('try again');
+
+      if (isRateLimit && attempts < maxAttempts) {
+        console.warn(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`);
+        await new Promise(r => setTimeout(r, 10000));
+      } else {
+        console.error(`    [API ERR] Failed ${videoLink}: ${e.message}`);
+        break; 
       }
     }
-  } catch (err: any) {
-    console.error(`[CRITICAL] Engine failure: ${err.message}`);
-  } finally {
-    await browser.close().catch(() => { });
   }
 }

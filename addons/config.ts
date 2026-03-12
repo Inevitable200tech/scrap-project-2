@@ -8,25 +8,24 @@ export interface SiteConfig {
   url: string;
   topicSelector: string;
   videoLinkSelector: string;
-  // Updated to Promise<string[]> to support async health checks
   parse: ($: any) => Promise<string[]>;
 }
 
 /**
- * Fast health check to see if a link is still alive.
- * Uses a short timeout to prevent the scraper from hanging.
+ * Sequential health check to keep memory flat.
  */
 async function isLinkAlive(url: string): Promise<boolean> {
   try {
     const response = await axios.get(url, { 
       timeout: 5000, 
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      validateStatus: (status) => status === 200 // Only count 200 OK as alive
+      validateStatus: (status) => status === 200 
     });
     
-    // Simple check for "Video Deleted" text often found in host HTML
     const html = response.data.toString().toLowerCase();
-    const isDeleted = html.includes('video was deleted') || html.includes('file not found');
+    const isDeleted = html.includes('video was deleted') || 
+                      html.includes('file not found') || 
+                      html.includes('no longer exists');
     
     return !isDeleted;
   } catch {
@@ -42,10 +41,12 @@ export const SITES: SiteConfig[] = [
     videoLinkSelector: '.cPost_contentWrap a[href]',
     parse: async ($) => {
       const domainMap: Record<string, string[]> = {};
+
       // 1. Group links by domain
       $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
-        if (/luluvid|pixhost|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
+        // Added postimg/imagetwist to avoid image host "false positives"
+        if (/luluvid|pixhost|postimg|imagetwist|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
 
         try {
           const domain = new URL(href).hostname.replace('www.', '');
@@ -57,44 +58,51 @@ export const SITES: SiteConfig[] = [
       const domains = Object.keys(domainMap);
       if (domains.length === 0) return [];
 
-      // 2. Perform Health Checks on all groups
-      const healthResults = await Promise.all(domains.map(async (domain) => {
+      // 2. Perform Health Checks SEQUENTIALLY (RAM Optimization)
+      const healthResults = [];
+      for (const domain of domains) {
         const links = domainMap[domain];
-        const aliveStatus = await Promise.all(links.map(link => isLinkAlive(link)));
-        const validLinks = links.filter((_, index) => aliveStatus[index]);
+        const validLinks = [];
         
-        return {
+        console.log(`    [CHECK] Validating ${domain}...`);
+        for (const link of links) {
+          if (await isLinkAlive(link)) {
+            validLinks.push(link);
+          }
+          // Micro-delay to yield the event loop
+          await new Promise(r => setTimeout(r, 100));
+        }
+        
+        healthResults.push({
           domain,
           allLinks: links,
-          validLinks: validLinks,
+          validLinks,
           count: validLinks.length
-        };
-      }));
+        });
+      }
 
-      // 3. Find the maximum number of WORKING links found in any group
+      // 3. Find the best host
       const maxWorkingCount = Math.max(...healthResults.map(r => r.count));
       if (maxWorkingCount === 0) {
-        console.log('[HEALTH] All links in all groups are dead.');
+        console.log('    [HEALTH] All links in all groups are dead.');
         return [];
       }
 
-      // 4. Finalists are domains that have the maximum working links
       const finalists = healthResults.filter(r => r.count === maxWorkingCount);
 
-      // 5. Tie-break finalists using your priority hierarchy
+      // 4. Tie-break priority
       const getPriority = (d: string) => {
         if (d.includes('streamtape')) return 1;
         if (d.includes('vidara')) return 2;
         if (d.includes('vidnest')) return 3;
-        return 4; // General/Other
+        return 4; 
       };
 
       finalists.sort((a, b) => getPriority(a.domain) - getPriority(b.domain));
 
       const winner = finalists[0];
-      console.log(`[DECISION] Winner: ${winner.domain} | Working: ${winner.count}/${winner.allLinks.length}`);
+      console.log(`    [DECISION] Winner: ${winner.domain} | Working: ${winner.count}/${winner.allLinks.length}`);
       
-      // Return only the WORKING links from the winning group
       return winner.validLinks;
     }
   }
