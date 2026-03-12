@@ -2,7 +2,7 @@
   "name": "scraper-api",
   "version": "1.0.0",
   "scripts": {
-    "start": "tsx main.ts",
+    "start": "tsx --expose-gc main.ts",
     "dev": "tsx --watch main.ts"
   },
   "dependencies": {
