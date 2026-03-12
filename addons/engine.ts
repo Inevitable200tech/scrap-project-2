@@ -80,6 +80,7 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
 
                 if (response.status === 200 || response.status === 201) {
                   console.log(`    [SUCCESS] Delivered: ${videoLink}`);
+                  console.log(`    [RESPONSE] ${response.data.message || 'No message'}`);
                   sent = true;
                 }
               } catch (e: any) {

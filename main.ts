@@ -1,5 +1,3 @@
-//main.ts
-
 import express from 'express';
 import { SITES, CHECK_INTERVAL_MS } from './addons/config';
 import { StateManager } from './addons/state';
@@ -9,17 +7,56 @@ const app = express();
 const state = new StateManager();
 const PORT = 823;
 
+/**
+ * Logs current memory usage to console in MB
+ */
+function logMemory() {
+  const used = process.memoryUsage();
+  const rss = Math.round(used.rss / 1024 / 1024);
+  const heap = Math.round(used.heapUsed / 1024 / 1024);
+  
+  console.log(`[MEMORY] RSS: ${rss}MB | Heap Used: ${heap}MB`);
+  
+  if (rss > 450) {
+    console.warn(`[!] CRITICAL: Memory usage is dangerously high (${rss}MB/512MB)`);
+  }
+}
+
 async function runMonitor() {
   console.log(`\n--- Starting Cycle ${new Date().toLocaleTimeString()} ---`);
+  logMemory();
+
   for (const site of SITES) {
-    await crawlSite(site, state);
+    try {
+      await crawlSite(site, state);
+    } catch (err) {
+      console.error(`[CRITICAL] Cycle failed for ${site.name}:`, err);
+    }
   }
+
   await state.save();
+  
+  console.log(`--- Cycle Finished ${new Date().toLocaleTimeString()} ---`);
+  logMemory(); // Check if memory cleared after browser.close()
+  
+  // Suggest a global garbage collection if possible
+  if (global.gc) {
+    global.gc();
+    console.log(`[MEMORY] Forced Garbage Collection.`);
+  }
 }
 
 // Future Interface Routes
 app.get('/api/status', (req, res) => {
-  res.json({ sites: SITES.map(s => s.name), interval: CHECK_INTERVAL_MS });
+  res.json({ 
+    sites: SITES.map(s => s.name), 
+    interval: CHECK_INTERVAL_MS,
+    memory: process.memoryUsage() 
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
 app.listen(PORT, async () => {
@@ -27,6 +64,6 @@ app.listen(PORT, async () => {
   await state.load();
   
   // Run loop
-  runMonitor();
+  await runMonitor();
   setInterval(runMonitor, CHECK_INTERVAL_MS);
 });
