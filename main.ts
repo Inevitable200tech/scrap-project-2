@@ -2,10 +2,14 @@ import express from 'express';
 import { SITES, CHECK_INTERVAL_MS } from './addons/config';
 import { StateManager } from './addons/state';
 import { crawlSite } from './addons/engine';
+import  dotenv from 'dotenv';
 
+dotenv.config({path: 'cert.env'});
 const app = express();
-const state = new StateManager();
 const PORT = 823;
+// Add your URI to Render Environment Variables
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://...";
+const state = new StateManager(MONGO_URI);
 
 /**
  * Logs current memory usage to console in MB
@@ -34,7 +38,6 @@ async function runMonitor() {
     }
   }
 
-  await state.save();
   
   console.log(`--- Cycle Finished ${new Date().toLocaleTimeString()} ---`);
   logMemory(); // Check if memory cleared after browser.close()
@@ -59,11 +62,13 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
+
 app.listen(PORT, async () => {
   console.log(`Monitor API listening on http://localhost:${PORT}`);
-  await state.load();
+  console.log('MONGO URL is set: '+MONGO_URI);
+  // Connect to DB once at startup
+  await state.connect();
   
-  // Run loop
   await runMonitor();
   setInterval(runMonitor, CHECK_INTERVAL_MS);
 });

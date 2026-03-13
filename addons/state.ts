@@ -1,29 +1,47 @@
-import fs from 'fs/promises';
-import path from 'path';
-
-const STORAGE_FILE = path.join(process.cwd(), 'previous-topics.json');
+import { MongoClient, Collection } from 'mongodb';
 
 export class StateManager {
-  private seenKeys: Set<string> = new Set();
+  private client: MongoClient;
+  private collection?: Collection;
+  private cache: Set<string> = new Set(); // Local cache for speed
 
-  async load() {
+  constructor(connectionString: string) {
+    this.client = new MongoClient(connectionString);
+  }
+
+  async connect() {
+    await this.client.connect();
+    const db = this.client.db('scraper_db');
+    this.collection = db.collection('visited_urls');
+    
+    // Load existing URLs into a local Set once to keep checks fast
+    const existing = await this.collection.find({}).toArray();
+    existing.forEach(item => this.cache.add(item.url));
+    console.log(`[STATE] Connected to MongoDB. Loaded ${this.cache.size} known URLs.`);
+  }
+
+  isNew(url: string, type: "topic_visited" | "video_host_link"): boolean {
+    if (this.cache.has(url)) return false;
+    
+    // Add to local cache and queue for DB
+    this.cache.add(url);
+    this.saveToDb(url, type);
+    return true;
+  }
+
+  private async saveToDb(url: string, type: string) {
     try {
-      const data = await fs.readFile(STORAGE_FILE, 'utf-8');
-      this.seenKeys = new Set(JSON.parse(data));
-      console.log(`[STATE] Loaded ${this.seenKeys.size} keys.`);
-    } catch {
-      console.log('[STATE] Fresh start.');
+      await this.collection?.updateOne(
+        { url }, 
+        { $set: { url, type, createdAt: new Date() } }, 
+        { upsert: true }
+      );
+    } catch (e) {
+      console.error(`[STATE ERR] DB Save failed: ${e}`);
     }
   }
 
-  async save() {
-    await fs.writeFile(STORAGE_FILE, JSON.stringify([...this.seenKeys], null, 2));
-  }
-
-  isNew(link: string, title: string): boolean {
-    const key = `${link}|${title.trim()}`;
-    if (this.seenKeys.has(key)) return false;
-    this.seenKeys.add(key);
-    return true;
+  async disconnect() {
+    await this.client.close();
   }
 }
