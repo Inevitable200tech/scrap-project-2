@@ -19,7 +19,7 @@ const BROWSER_ARGS = [
 
 /**
  * Helper to perform a single scoped navigation and return data.
- * This ensures the browser process is killed immediately after the task.
+ * Process isolation: Browser is killed immediately after data is fetched.
  */
 async function getPageData(url: string, referer?: string) {
   const browser = await playwrightExtra.chromium.launch({ 
@@ -55,7 +55,6 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
   let uniqueTopics: string[] = [];
 
   try {
-    // 1. Get the Topic List from the index
     const indexData = await getPageData(site.url);
     const $index = cheerio.load(indexData.content);
     
@@ -65,26 +64,28 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
       if (href) rawUrls.push(href);
     });
 
-    uniqueTopics = [...new Set(rawUrls)].filter(url => 
-        url.includes('/topic/') && !url.includes('/tags/')
-    );
+    // Filter for actual topics and limit to the 15 newest to stay within Render time limits
+    uniqueTopics = [...new Set(rawUrls)]
+      .filter(url => url.includes('/topic/') && !url.includes('/tags/'))
+      .slice(0, 15); 
 
-    console.log(`[INDEX] Found ${uniqueTopics.length} topics. Processing with process isolation...`);
+    console.log(`[INDEX] Found ${uniqueTopics.length} topics to check.`);
 
   } catch (err: any) {
     console.error(`[CRITICAL] Failed to scan index: ${err.message}`);
     return;
   }
 
-  // 2. Iterate through each Topic with a FRESH browser instance per topic
+  // 2. Iterate through each Topic
   for (const topicUrl of uniqueTopics) {
-    if (!state.isNew(topicUrl, "topic_visited")) continue;
+    // CRITICAL: isNew is now ASYNC because of MongoDB
+    const isNewTopic = await state.isNew(topicUrl, "topic_visited");
+    if (!isNewTopic) continue;
 
     try {
-      // Launch, Scrape, and Kill browser for this specific topic
+      console.log(`  [NEW TOPIC] Processing: ${topicUrl}`);
       const { content, title } = await getPageData(topicUrl, site.url);
-      console.log(`  [TOPIC] Title: "${title}"`);
-
+      
       const $ = cheerio.load(content);
       const videoLinks = await site.parse($);
 
@@ -93,21 +94,25 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
       }
 
       for (const videoLink of videoLinks) {
-        if (state.isNew(videoLink, "video_host_link")) {
+        // CRITICAL: isNew is now ASYNC
+        const isNewVideo = await state.isNew(videoLink, "video_host_link");
+        if (isNewVideo) {
           console.log(`    [SENDING] → ${videoLink}`);
           await sendToApiWithRetry(videoLink, site.name, topicUrl, title);
-          // Small gap to prevent API rate limits
-          await new Promise(r => setTimeout(r, 3000));
+          
+          // Throttling to be nice to your API
+          await new Promise(r => setTimeout(r, 2000));
         }
       }
     } catch (topicErr: any) {
-      console.error(`  [SKIP] Timeout or Error on topic ${topicUrl}: ${topicErr.message}`);
+      console.error(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`);
     }
   }
+  console.log(`[FINISHED] Cycle complete. Waiting for next interval...`);
 }
 
 /**
- * Robust API delivery with built-in retry for 429/202 responses
+ * Robust API delivery with built-in retry
  */
 async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl: string, title: string) {
   let sent = false;
@@ -129,7 +134,7 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
       }
     } catch (e: any) {
       attempts++;
-      const isRateLimit = e.response?.status === 202 || e.response?.status === 429 || e.message.includes('try again');
+      const isRateLimit = e.response?.status === 202 || e.response?.status === 429;
 
       if (isRateLimit && attempts < maxAttempts) {
         console.warn(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`);
