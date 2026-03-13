@@ -46,7 +46,7 @@ export const SITES: SiteConfig[] = [
       $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
         // Added postimg/imagetwist to avoid image host "false positives"
-        if (/luluvid|pixhost|postimg|imagetwist|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
+        if (/luluvid|dropmms|pixhost|postimg|imagetwist|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
 
         try {
           const domain = new URL(href).hostname.replace('www.', '');
