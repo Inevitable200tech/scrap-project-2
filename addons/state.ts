@@ -85,7 +85,7 @@ export class StateManager {
       await this.collection.insertOne({
         hash,
         type,
-        url: url.substring(0, 500), 
+        url: url.substring(0, 31), 
         createdAt: new Date()
       });
 
