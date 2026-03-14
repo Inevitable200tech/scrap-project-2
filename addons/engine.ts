@@ -73,7 +73,7 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
 
     uniqueTopics = [...new Set(rawUrls)]
       .filter(url => url.includes('/topic/') && !url.includes('/tags/'))
-      .slice(0, 15); 
+      .slice(0, 25); 
 
     log(`[INDEX] Found ${uniqueTopics.length} potential topics.`);
 
