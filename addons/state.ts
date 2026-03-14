@@ -22,7 +22,7 @@ export class StateManager {
       await this.collection.createIndex({ hash: 1 }, { unique: true });
 
       // 2. TTL Index: Automatically delete 'topic_visited' types after 7 days (604800 seconds)
-      // This keeps your 512MB DB from ever getting full.
+      // This prevents the 512MB free tier from filling up.
       await this.collection.createIndex(
         { createdAt: 1 }, 
         { 
@@ -39,6 +39,20 @@ export class StateManager {
   }
 
   /**
+   * Fetches document counts for the verbose logging in main.ts
+   */
+  async getStats() {
+    if (!this.collection) return { topics: 0, links: 0 };
+    
+    const [topics, links] = await Promise.all([
+      this.collection.countDocuments({ type: 'topic_visited' }),
+      this.collection.countDocuments({ type: 'video_host_link' })
+    ]);
+
+    return { topics, links };
+  }
+
+  /**
    * Helper to convert long URLs into short 32-char MD5 hashes
    */
   private getHash(url: string): string {
@@ -47,7 +61,7 @@ export class StateManager {
 
   /**
    * Checks if URL is new. 
-   * Note: This is now ASYNC to save RAM by querying DB directly.
+   * Uses direct DB queries to keep RAM usage near zero.
    */
   async isNew(url: string, type: "topic_visited" | "video_host_link"): Promise<boolean> {
     if (!this.collection) return true;
@@ -59,6 +73,11 @@ export class StateManager {
       const existing = await this.collection.findOne({ hash });
       
       if (existing) {
+        // Optimization: If it's an existing topic, we could update the 'createdAt' 
+        // to keep it from expiring while it's still active on the front page.
+        if (type === 'topic_visited') {
+           this.collection.updateOne({ hash }, { $set: { createdAt: new Date() } }).catch(()=>{});
+        }
         return false;
       }
 
@@ -66,13 +85,13 @@ export class StateManager {
       await this.collection.insertOne({
         hash,
         type,
-        url: url.substring(0, 500), // Store a snippet for debugging, but hash is for lookup
+        url: url.substring(0, 500), 
         createdAt: new Date()
       });
 
       return true;
     } catch (e) {
-      // If a race condition occurs, unique index on 'hash' catches it
+      // Catch duplicate key errors from race conditions
       return false;
     }
   }

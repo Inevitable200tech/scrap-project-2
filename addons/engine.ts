@@ -7,6 +7,17 @@ import { StateManager } from './state';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
+/**
+ * Helper to prefix every log with a high-precision timestamp
+ */
+function log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
+  const timestamp = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const line = `[${timestamp}] ${message}`;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
+
 const BROWSER_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -17,10 +28,6 @@ const BROWSER_ARGS = [
   '--disable-gpu'
 ];
 
-/**
- * Helper to perform a single scoped navigation and return data.
- * Process isolation: Browser is killed immediately after data is fetched.
- */
 async function getPageData(url: string, referer?: string) {
   const browser = await playwrightExtra.chromium.launch({ 
     headless: true, 
@@ -33,7 +40,6 @@ async function getPageData(url: string, referer?: string) {
     });
     const page = await context.newPage();
     
-    // RAM SAVER: Block heavy assets
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
       return ['image', 'stylesheet', 'font', 'media'].includes(type) ? route.abort() : route.continue();
@@ -50,9 +56,10 @@ async function getPageData(url: string, referer?: string) {
 }
 
 export async function crawlSite(site: SiteConfig, state: StateManager) {
-  console.log(`[INDEX] Scanning index: ${site.url}`);
+  log(`[INDEX] Scanning: ${site.url}`);
   
   let uniqueTopics: string[] = [];
+  let skippedTopics = 0;
 
   try {
     const indexData = await getPageData(site.url);
@@ -64,56 +71,61 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
       if (href) rawUrls.push(href);
     });
 
-    // Filter for actual topics and limit to the 15 newest to stay within Render time limits
     uniqueTopics = [...new Set(rawUrls)]
       .filter(url => url.includes('/topic/') && !url.includes('/tags/'))
       .slice(0, 15); 
 
-    console.log(`[INDEX] Found ${uniqueTopics.length} topics to check.`);
+    log(`[INDEX] Found ${uniqueTopics.length} potential topics.`);
 
   } catch (err: any) {
-    console.error(`[CRITICAL] Failed to scan index: ${err.message}`);
+    log(`[CRITICAL] Failed to scan index: ${err.message}`, 'error');
     return;
   }
 
-  // 2. Iterate through each Topic
   for (const topicUrl of uniqueTopics) {
-    // CRITICAL: isNew is now ASYNC because of MongoDB
     const isNewTopic = await state.isNew(topicUrl, "topic_visited");
-    if (!isNewTopic) continue;
+    
+    if (!isNewTopic) {
+      skippedTopics++;
+      continue;
+    }
 
     try {
-      console.log(`  [NEW TOPIC] Processing: ${topicUrl}`);
+      log(`  [NEW TOPIC] ${topicUrl}`);
       const { content, title } = await getPageData(topicUrl, site.url);
       
       const $ = cheerio.load(content);
       const videoLinks = await site.parse($);
-
-      if (videoLinks.length === 0) {
-        console.log(`    [INFO] No valid links found.`);
-      }
+      let newLinksCount = 0;
+      let skippedLinksCount = 0;
 
       for (const videoLink of videoLinks) {
-        // CRITICAL: isNew is now ASYNC
         const isNewVideo = await state.isNew(videoLink, "video_host_link");
         if (isNewVideo) {
-          console.log(`    [SENDING] → ${videoLink}`);
+          newLinksCount++;
+          log(`    [SENDING] → ${videoLink}`);
           await sendToApiWithRetry(videoLink, site.name, topicUrl, title);
-          
-          // Throttling to be nice to your API
           await new Promise(r => setTimeout(r, 2000));
+        } else {
+          skippedLinksCount++;
         }
       }
+
+      if (skippedLinksCount > 0) {
+        log(`    [STATE] Ignored ${skippedLinksCount} duplicate video links.`);
+      }
+      
     } catch (topicErr: any) {
-      console.error(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`);
+      log(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`, 'error');
     }
   }
-  console.log(`[FINISHED] Cycle complete. Waiting for next interval...`);
+
+  if (skippedTopics > 0) {
+    log(`[STATE] Ignored ${skippedTopics} topics (already in database).`);
+  }
+  log(`[FINISHED] Cycle complete for ${site.name}.`);
 }
 
-/**
- * Robust API delivery with built-in retry
- */
 async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl: string, title: string) {
   let sent = false;
   let attempts = 0;
@@ -129,7 +141,7 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
       });
 
       if (response.status === 200 || response.status === 201) {
-        console.log(`    [SUCCESS] Delivered: ${videoLink}`);
+        log(`    [SUCCESS] Delivered: ${videoLink}`);
         sent = true;
       }
     } catch (e: any) {
@@ -137,10 +149,10 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
       const isRateLimit = e.response?.status === 202 || e.response?.status === 429;
 
       if (isRateLimit && attempts < maxAttempts) {
-        console.warn(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`);
+        log(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`, 'warn');
         await new Promise(r => setTimeout(r, 10000));
       } else {
-        console.error(`    [API ERR] Failed ${videoLink}: ${e.message}`);
+        log(`    [API ERR] Failed ${videoLink}: ${e.message}`, 'error');
         break; 
       }
     }
