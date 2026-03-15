@@ -146,7 +146,7 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
       }
     } catch (e: any) {
       attempts++;
-      const isRateLimit = e.response?.status === 202 || e.response?.status === 429;
+      const isRateLimit = e.response?.status === 202 || e.response?.status === 304;
 
       if (isRateLimit && attempts < maxAttempts) {
         log(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`, 'warn');
