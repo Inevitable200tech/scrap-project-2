@@ -16,17 +16,17 @@ export interface SiteConfig {
  */
 async function isLinkAlive(url: string): Promise<boolean> {
   try {
-    const response = await axios.get(url, { 
-      timeout: 5000, 
+    const response = await axios.get(url, {
+      timeout: 5000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      validateStatus: (status) => status === 200 
+      validateStatus: (status) => status === 200
     });
-    
+
     const html = response.data.toString().toLowerCase();
-    const isDeleted = html.includes('video was deleted') || 
-                      html.includes('file not found') || 
-                      html.includes('no longer exists');
-    
+    const isDeleted = html.includes('video was deleted') ||
+      html.includes('file not found') ||
+      html.includes('no longer exists');
+
     return !isDeleted;
   } catch {
     return false;
@@ -46,13 +46,12 @@ export const SITES: SiteConfig[] = [
       $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
         // Added postimg/imagetwist to avoid image host "false positives"
-        if (/luluvid|dropmms|pixhost|postimg|imagetwist|krakenfiles|upfiles|frdl\.io|torupload/i.test(href)) return;
-
+        if (/luluvid|dropmms|pixhost|postimg|imagetwist|krakenfiles|upfiles|frdl\.io|torupload|file-upload/i.test(href)) return;
         try {
           const domain = new URL(href).hostname.replace('www.', '');
           if (!domainMap[domain]) domainMap[domain] = [];
           domainMap[domain].push(href);
-        } catch (e) {}
+        } catch (e) { }
       });
 
       const domains = Object.keys(domainMap);
@@ -63,7 +62,7 @@ export const SITES: SiteConfig[] = [
       for (const domain of domains) {
         const links = domainMap[domain];
         const validLinks = [];
-        
+
         console.log(`    [CHECK] Validating ${domain}...`);
         for (const link of links) {
           if (await isLinkAlive(link)) {
@@ -72,7 +71,7 @@ export const SITES: SiteConfig[] = [
           // Micro-delay to yield the event loop
           await new Promise(r => setTimeout(r, 100));
         }
-        
+
         healthResults.push({
           domain,
           allLinks: links,
@@ -95,14 +94,14 @@ export const SITES: SiteConfig[] = [
         if (d.includes('streamtape')) return 1;
         if (d.includes('vidara')) return 2;
         if (d.includes('vidnest')) return 3;
-        return 4; 
+        return 4;
       };
 
       finalists.sort((a, b) => getPriority(a.domain) - getPriority(b.domain));
 
       const winner = finalists[0];
       console.log(`    [DECISION] Winner: ${winner.domain} | Working: ${winner.count}/${winner.allLinks.length}`);
-      
+
       return winner.validLinks;
     }
   }
