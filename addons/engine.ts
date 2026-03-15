@@ -131,16 +131,9 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
   let attempts = 0;
   const maxAttempts = 3;
 
-  // Create an axios instance with keepAlive enabled and a 15+ minute timeout
-  const axiosInstance = axios.create({
-    timeout: 25 * 60 * 1000, // 16 minutes
-    httpAgent: new (require('http').Agent)({ keepAlive: true, keepAliveMsecs: 16 * 60 * 1000 }),
-    httpsAgent: new (require('https').Agent)({ keepAlive: true, keepAliveMsecs: 16 * 60 * 1000 }),
-  });
-
   while (!sent && attempts < maxAttempts) {
     try {
-      const response = await axiosInstance.post(API_ENDPOINT, {
+      const response = await axios.post(API_ENDPOINT, {
         url: videoLink,
         source: siteName,
         parentTopic: topicUrl,
@@ -153,7 +146,7 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
       }
     } catch (e: any) {
       attempts++;
-      const isRateLimit = e.response?.status === 202 || e.response?.status === 304;
+      const isRateLimit = e.response?.status === 202 || e.response?.status === 429;
 
       if (isRateLimit && attempts < maxAttempts) {
         log(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`, 'warn');
