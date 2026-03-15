@@ -105,7 +105,7 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
           newLinksCount++;
           log(`    [SENDING] → ${videoLink}`);
           await sendToApiWithRetry(videoLink, site.name, topicUrl, title);
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 25000)); //Increase the timeout for each video link to 25 seconds to reduce the risk of hitting rate limits
         } else {
           skippedLinksCount++;
         }
@@ -132,6 +132,7 @@ async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl:
   const maxAttempts = 3;
 
   while (!sent && attempts < maxAttempts) {
+
     try {
       const response = await axios.post(API_ENDPOINT, {
         url: videoLink,
