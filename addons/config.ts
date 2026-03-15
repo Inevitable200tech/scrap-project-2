@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-export const API_ENDPOINT = 'https://scrap-project-1-j2sd.onrender.com/api/scrape/';
+export const API_ENDPOINT = 'https://scrap-project-1-j2sd.onrender.com/api/scrape';
 export const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface SiteConfig {
