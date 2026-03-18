@@ -6,30 +6,28 @@ export const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 export interface SiteConfig {
   name: string;
   url: string;
+  // How many pages to crawl per cycle. 1 = front page only.
+  // Increase this when you're ready to crawl deeper.
+  pagesToCrawl: number;
   topicSelector: string;
   videoLinkSelector: string;
   parse: ($: any) => Promise<string[]>;
 }
 
 // ── Host priority ──────────────────────────────────────────────────────────
-// Known/supported hosts rank higher than unknown ones.
-// Lower number = higher priority.
 function getHostPriority(domain: string): number {
   if (domain.includes('streamtape'))  return 1;
   if (domain.includes('vidara'))      return 2;
   if (domain.includes('vidnest'))     return 3;
   if (domain.includes('vidsonic'))    return 4;
   if (domain.includes('boodstream'))  return 5;
-  return 99; // unknown — lowest priority but still usable as fallback
+  return 99;
 }
 
 // ── Domains to ignore entirely ─────────────────────────────────────────────
-// Image hosts, file lockers, forum itself — never video content.
-const IGNORED_DOMAINS = /luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload/i;
+const IGNORED_DOMAINS = /luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload|twitter|reddit|linkedin|pinterest|facebook/i;
 
 // ── Quick dead check ───────────────────────────────────────────────────────
-// Only catches definitive HTTP 404/410.
-// TLS-blocking hosts (vidsonic etc.) return false — scraper handles them.
 async function isDefinitelyDead(url: string): Promise<boolean> {
   try {
     const res = await axios.head(url, {
@@ -41,24 +39,48 @@ async function isDefinitelyDead(url: string): Promise<boolean> {
     });
     return res.status === 404 || res.status === 410;
   } catch {
-    return false; // assume alive — scraper will catch it
+    return false;
   }
 }
+
+// ── Page URL builder ───────────────────────────────────────────────────────
+// Builds paginated URLs for IPS (Invision Power Suite) forums.
 
 export const SITES: SiteConfig[] = [
   {
     name: 'dropmms',
     url: 'https://dropmms.co/forum/2-desi-new-videoz-hd-sd/',
-    topicSelector: '.tthumb_grid_item .tthumb_gal_title a',
+
+    // ── Pagination control ─────────────────────────────────────────────
+    // Set to 1 for front page only.
+    // When ready to go deeper, increase this number.
+    // The forum has 1079 pages × 24 topics = ~25,896 topics total.
+    // Suggested progression: 1 → 5 → 25 → 100 as backlog is processed.
+    pagesToCrawl: 1,
+
+    topicSelector: 'a[href*="/topic/"]',
     videoLinkSelector: '.cPost_contentWrap a[href]',
+
     parse: async ($) => {
 
-      // ── Step 1: Collect and group links by domain ──────────────────────
+      // ── Only parse the first post (OP) ──────────────────────────────
+      // Replies on this forum quote the OP verbatim, so every post
+      // contains identical links. Parsing only the first post avoids
+      // collecting the same URLs 3× and speeds up dead-link checking.
+      const firstPost = $('.cPost_contentWrap').first();
+
+      if (!firstPost.length) {
+        console.log('    [PARSE] Could not find first post container');
+        return [];
+      }
+
+      // ── Collect and group links by domain ────────────────────────────
       const domainMap: Record<string, string[]> = {};
 
-      $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
+      firstPost.find('a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
         if (IGNORED_DOMAINS.test(href)) return;
+        if (!href.startsWith('http')) return;
 
         try {
           const domain = new URL(href).hostname.replace('www.', '');
@@ -74,16 +96,16 @@ export const SITES: SiteConfig[] = [
       const domains = Object.keys(domainMap);
 
       if (domains.length === 0) {
-        console.log('    [PARSE] No video links found in topic');
+        console.log('    [PARSE] No video links found in first post');
         return [];
       }
 
-      console.log(`    [PARSE] Found ${domains.length} host(s):`);
+      console.log(`    [PARSE] Found ${domains.length} host(s) in first post:`);
       domains.forEach(d => {
         console.log(`      ${d}: ${domainMap[d].length} link(s)`);
       });
 
-      // ── Step 2: Quick dead check per domain ───────────────────────────
+      // ── Quick dead check per domain ──────────────────────────────────
       const domainStats: {
         domain: string;
         allLinks: string[];
@@ -108,7 +130,7 @@ export const SITES: SiteConfig[] = [
           await new Promise(r => setTimeout(r, 100));
         }
 
-        console.log(`      [${domain}] Live: ${liveLinks.length}/${allLinks.length} | Priority: ${getHostPriority(domain)}`);
+        console.log(`      [${domain}] Live: ${liveLinks.length}/${allLinks.length}`);
 
         domainStats.push({
           domain,
@@ -119,24 +141,15 @@ export const SITES: SiteConfig[] = [
         });
       }
 
-      // ── Step 3: Selection logic ────────────────────────────────────────
-      //
-      // Goal: find the single best host that has the most complete set of
-      // parts for the video. Rules in order:
-      //
-      // Rule 1: Prefer hosts where ALL links are alive (no dead parts).
+      // ── Pick the best host ───────────────────────────────────────────
+      // Rule 1: Prefer hosts where ALL links are alive (complete set of parts).
       // Rule 2: Among complete hosts, pick the one with the most live links.
       // Rule 3: Tie-break by priority (lower = better / more supported).
-      // Rule 4: If NO host is fully alive, pick the one with the most live
-      //         links regardless, same tie-break.
-      //
-      // This means boodstream (unknown, priority 99) beats vidara (3 parts)
-      // if boodstream has 4 complete alive parts and vidara has 3.
-
+      // Rule 4: If no complete host exists, fall back to most live links.
       const withLiveLinks = domainStats.filter(d => d.liveLinks.length > 0);
 
       if (withLiveLinks.length === 0) {
-        console.log('    [DECISION] All links across all hosts are dead — skipping topic');
+        console.log('    [DECISION] All links across all hosts are dead — skipping');
         return [];
       }
 
@@ -147,13 +160,8 @@ export const SITES: SiteConfig[] = [
         console.log('    [WARN] No host has all parts alive — using best partial match');
       }
 
-      // Find the maximum live link count in the pool
       const maxLive = Math.max(...pool.map(d => d.liveLinks.length));
-
-      // All hosts tied at that count
       const finalists = pool.filter(d => d.liveLinks.length === maxLive);
-
-      // Tie-break: lower priority number wins (known hosts beat unknown)
       finalists.sort((a, b) => a.priority - b.priority);
 
       const winner = finalists[0];

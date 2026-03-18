@@ -223,39 +223,61 @@ export async function tickJobTracker(): Promise<void> {
   }
 }
 
+
+// Add to top of engine.ts
+function buildPageUrl(baseUrl: string, page: number): string {
+  if (page <= 1) return baseUrl;
+  const base = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
+  return `${base}page/${page}/`;
+}
+
 // ── Main crawler ───────────────────────────────────────────────────────────
+
+// Replace just the crawlSite function in engine.ts
 
 export async function crawlSite(
   site: SiteConfig,
   state: StateManager,
   pollUrlBase: string
 ) {
-  log(`[INDEX] Scanning: ${site.url}`);
+  log(`[INDEX] Scanning: ${site.name} (${site.pagesToCrawl} page(s))`);
 
-  let uniqueTopics: string[] = [];
+  const uniqueTopics = new Set<string>();
   let skippedTopics = 0;
 
-  try {
-    const indexData = await getPageData(site.url);
-    const $index = cheerio.load(indexData.content);
+  // ── Crawl index pages ────────────────────────────────────────────────────
+  for (let page = 1; page <= site.pagesToCrawl; page++) {
+    const pageUrl = buildPageUrl(site.url, page);
+    log(`[INDEX] Page ${page}/${site.pagesToCrawl}: ${pageUrl}`);
 
-    const rawUrls: string[] = [];
-    $index(site.topicSelector).each((_, el) => {
-      const href = $index(el).attr('href');
-      if (href) rawUrls.push(href);
-    });
+    try {
+      const { content } = await getPageData(pageUrl);
+      const $index = cheerio.load(content);
 
-    uniqueTopics = [...new Set(rawUrls)]
-      .filter(url => url.includes('/topic/') && !url.includes('/tags/'))
-      .slice(0, 25);
+      $index(site.topicSelector).each((_, el) => {
+        const href = $index(el).attr('href') || '';
+        // Only keep clean topic URLs — skip tags, profiles, etc.
+        if (href.includes('/topic/') && !href.includes('/tags/')) {
+          uniqueTopics.add(href);
+        }
+      });
 
-    log(`[INDEX] Found ${uniqueTopics.length} potential topics.`);
+      log(`[INDEX] Page ${page}: ${uniqueTopics.size} unique topic(s) so far`);
 
-  } catch (err: any) {
-    log(`[CRITICAL] Failed to scan index: ${err.message}`, 'error');
-    return;
+      // Polite delay between index page fetches
+      if (page < site.pagesToCrawl) {
+        await new Promise(r => setTimeout(r, 2_000));
+      }
+
+    } catch (err: any) {
+      log(`[INDEX] Failed to load page ${page}: ${err.message}`, 'error');
+      // Continue to next page rather than aborting the whole crawl
+    }
   }
 
+  log(`[INDEX] Total unique topics found: ${uniqueTopics.size}`);
+
+  // ── Process topics ───────────────────────────────────────────────────────
   let totalSubmitted = 0;
 
   for (const topicUrl of uniqueTopics) {
@@ -301,14 +323,12 @@ export async function crawlSite(
       for (let i = 0; i < newLinks.length; i++) {
         const videoLink = newLinks[i];
         log(`    [SUBMIT] ${i + 1}/${total} → ${videoLink}`);
-        // Fire and forget — job is tracked in activeJobs
         await submitAndTrack(videoLink, title, pollUrlBase);
-        // Small delay between submissions to avoid flooding the API
         await new Promise(r => setTimeout(r, 1_000));
       }
 
       totalSubmitted += total;
-      log(`    [TOPIC DONE] Submitted ${total} job(s) for: ${topicUrl}`);
+      log(`    [TOPIC DONE] Submitted ${total} job(s)`);
 
     } catch (topicErr: any) {
       log(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`, 'error');
@@ -316,7 +336,7 @@ export async function crawlSite(
   }
 
   if (skippedTopics > 0) {
-    log(`[STATE] Ignored ${skippedTopics} topics (already in database).`);
+    log(`[STATE] Ignored ${skippedTopics} already-seen topics`);
   }
-  log(`[FINISHED] Cycle complete for ${site.name} — ${totalSubmitted} job(s) submitted, ${activeJobs.size} total active`);
+  log(`[FINISHED] ${site.name} — ${totalSubmitted} job(s) submitted | ${activeJobs.size} total active`);
 }
