@@ -155,10 +155,10 @@ export async function tickJobTracker(): Promise<void> {
   log(`[TRACKER] Checking ${activeJobs.size} active job(s)...`);
 
   for (const [jobId, tracked] of activeJobs.entries()) {
-    // Hard timeout — 15 minutes per job
+    // Hard timeout — 30 minutes per job
     const elapsed = Date.now() - tracked.submittedAt;
-    if (elapsed > 15 * 60 * 1000) {
-      log(`[TRACKER] Job ${jobId} timed out (15min) — giving up`, 'warn');
+    if (elapsed > 30 * 60 * 1000) {
+      log(`[TRACKER] Job ${jobId} timed out (30min) — giving up`, 'warn');
       activeJobs.delete(jobId);
       continue;
     }
