@@ -71,6 +71,15 @@ interface JobResponse {
   error?: string;
 }
 
+// Thrown when a job fails because the video is confirmed dead at the source.
+// Caught in submitAndWait to skip retries entirely.
+class DeadVideoError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeadVideoError';
+  }
+}
+
 /**
  * Submit a video URL to the scraper API job queue.
  * Returns the jobId immediately without waiting for processing.
@@ -97,10 +106,10 @@ async function waitForJob(
   pollUrlBase: string,
   videoLink: string
 ): Promise<JobResponse> {
-  const FAST_INTERVAL_MS  = 5_000;
-  const SLOW_INTERVAL_MS  = 15_000;
-  const FAST_PHASE_MS     = 2 * 60 * 1000;   // first 2 minutes
-  const HARD_TIMEOUT_MS   = 10 * 60 * 1000;  // 10 minutes total
+  const FAST_INTERVAL_MS = 5_000;
+  const SLOW_INTERVAL_MS = 15_000;
+  const FAST_PHASE_MS    = 2 * 60 * 1000;  // first 2 minutes
+  const HARD_TIMEOUT_MS  = 10 * 60 * 1000; // 10 minutes total
 
   const started = Date.now();
   let lastStatus = '';
@@ -139,6 +148,17 @@ async function waitForJob(
     }
 
     if (job.status === 'failed') {
+      // Dead video — no point retrying, throw a typed error so submitAndWait
+      // can skip the retry loop entirely
+      if (job.error?.toLowerCase().includes('removed by the uploader') ||
+          job.error?.toLowerCase().includes('dead video') ||
+          job.error?.toLowerCase().includes('video has been removed') ||
+          job.error?.toLowerCase().includes('http 404') ||
+          job.error?.toLowerCase().includes('http 410')) {
+        throw new DeadVideoError(`Dead video: ${job.error}`);
+      }
+
+      // Any other failure — let submitAndWait decide whether to retry
       throw new Error(`Job ${jobId} failed: ${job.error}`);
     }
   }
@@ -147,6 +167,7 @@ async function waitForJob(
 /**
  * Submit a video link to the job queue and wait for the result.
  * Retries submission up to maxAttempts times on transient errors.
+ * Dead videos are never retried.
  */
 async function submitAndWait(
   videoLink: string,
@@ -167,6 +188,12 @@ async function submitAndWait(
       return; // success
 
     } catch (e: any) {
+      // Dead video — skip immediately, no retry
+      if (e instanceof DeadVideoError) {
+        log(`    [DEAD] ${e.message} — skipping without retry`, 'warn');
+        return;
+      }
+
       const isRateLimit = e.response?.status === 429;
 
       if (isRateLimit && attempts < maxAttempts) {
@@ -231,6 +258,7 @@ export async function crawlSite(
       const videoLinks = await site.parse($);
       let newLinksCount = 0;
       let skippedLinksCount = 0;
+      let deadLinksCount = 0;
 
       for (const videoLink of videoLinks) {
         const isNewVideo = await state.isNew(videoLink, 'video_host_link');
@@ -243,8 +271,7 @@ export async function crawlSite(
         newLinksCount++;
 
         // Submit to job queue and wait for terminal status before moving on.
-        // This ensures we don't flood the scraper API and we know the outcome
-        // of each video before processing the next one.
+        // Dead videos return immediately without retrying.
         await submitAndWait(videoLink, title, pollUrlBase);
 
         // Brief pause between videos to avoid hammering the scraper API
