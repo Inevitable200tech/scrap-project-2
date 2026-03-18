@@ -11,25 +11,37 @@ export interface SiteConfig {
   parse: ($: any) => Promise<string[]>;
 }
 
-/**
- * Sequential health check to keep memory flat.
- */
-async function isLinkAlive(url: string): Promise<boolean> {
+// ── Host priority ──────────────────────────────────────────────────────────
+// Known/supported hosts rank higher than unknown ones.
+// Lower number = higher priority.
+function getHostPriority(domain: string): number {
+  if (domain.includes('streamtape'))  return 1;
+  if (domain.includes('vidara'))      return 2;
+  if (domain.includes('vidnest'))     return 3;
+  if (domain.includes('vidsonic'))    return 4;
+  if (domain.includes('boodstream'))  return 5;
+  return 99; // unknown — lowest priority but still usable as fallback
+}
+
+// ── Domains to ignore entirely ─────────────────────────────────────────────
+// Image hosts, file lockers, forum itself — never video content.
+const IGNORED_DOMAINS = /luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload/i;
+
+// ── Quick dead check ───────────────────────────────────────────────────────
+// Only catches definitive HTTP 404/410.
+// TLS-blocking hosts (vidsonic etc.) return false — scraper handles them.
+async function isDefinitelyDead(url: string): Promise<boolean> {
   try {
-    const response = await axios.get(url, {
-      timeout: 5000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      validateStatus: (status) => status === 200
+    const res = await axios.head(url, {
+      timeout: 4000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+      validateStatus: () => true,
     });
-
-    const html = response.data.toString().toLowerCase();
-    const isDeleted = html.includes('video was deleted') ||
-      html.includes('file not found') ||
-      html.includes('no longer exists');
-
-    return !isDeleted;
+    return res.status === 404 || res.status === 410;
   } catch {
-    return false;
+    return false; // assume alive — scraper will catch it
   }
 }
 
@@ -40,69 +52,121 @@ export const SITES: SiteConfig[] = [
     topicSelector: '.tthumb_grid_item .tthumb_gal_title a',
     videoLinkSelector: '.cPost_contentWrap a[href]',
     parse: async ($) => {
+
+      // ── Step 1: Collect and group links by domain ──────────────────────
       const domainMap: Record<string, string[]> = {};
 
-      // 1. Group links by domain
       $('.cPost_contentWrap a[href]').each((_: any, el: any) => {
         const href = $(el).attr('href') || '';
-        // Added postimg/imagetwist to avoid image host "false positives"
-        if (/luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload/i.test(href)) return;
+        if (IGNORED_DOMAINS.test(href)) return;
+
         try {
           const domain = new URL(href).hostname.replace('www.', '');
           if (!domainMap[domain]) domainMap[domain] = [];
-          domainMap[domain].push(href);
-        } catch (e) { }
+          if (!domainMap[domain].includes(href)) {
+            domainMap[domain].push(href);
+          }
+        } catch {
+          // skip malformed URLs
+        }
       });
 
       const domains = Object.keys(domainMap);
-      if (domains.length === 0) return [];
 
-      // 2. Perform Health Checks SEQUENTIALLY (RAM Optimization)
-      const healthResults = [];
-      for (const domain of domains) {
-        const links = domainMap[domain];
-        const validLinks = [];
-
-        console.log(`    [CHECK] Validating ${domain}...`);
-        for (const link of links) {
-          if (await isLinkAlive(link)) {
-            validLinks.push(link);
-          }
-          // Micro-delay to yield the event loop
-          await new Promise(r => setTimeout(r, 100));
-        }
-
-        healthResults.push({
-          domain,
-          allLinks: links,
-          validLinks,
-          count: validLinks.length
-        });
-      }
-
-      // 3. Find the best host
-      const maxWorkingCount = Math.max(...healthResults.map(r => r.count));
-      if (maxWorkingCount === 0) {
-        console.log('    [HEALTH] All links in all groups are dead.');
+      if (domains.length === 0) {
+        console.log('    [PARSE] No video links found in topic');
         return [];
       }
 
-      const finalists = healthResults.filter(r => r.count === maxWorkingCount);
+      console.log(`    [PARSE] Found ${domains.length} host(s):`);
+      domains.forEach(d => {
+        console.log(`      ${d}: ${domainMap[d].length} link(s)`);
+      });
 
-      // 4. Tie-break priority
-      const getPriority = (d: string) => {
-        if (d.includes('streamtape')) return 1;
-        if (d.includes('vidara')) return 2;
-        if (d.includes('vidnest')) return 3;
-        return 4;
-      };
+      // ── Step 2: Quick dead check per domain ───────────────────────────
+      const domainStats: {
+        domain: string;
+        allLinks: string[];
+        liveLinks: string[];
+        deadCount: number;
+        priority: number;
+      }[] = [];
 
-      finalists.sort((a, b) => getPriority(a.domain) - getPriority(b.domain));
+      for (const domain of domains) {
+        const allLinks = domainMap[domain];
+        const liveLinks: string[] = [];
+        let deadCount = 0;
+
+        for (const link of allLinks) {
+          const dead = await isDefinitelyDead(link);
+          if (dead) {
+            deadCount++;
+            console.log(`      [DEAD] ${link}`);
+          } else {
+            liveLinks.push(link);
+          }
+          await new Promise(r => setTimeout(r, 100));
+        }
+
+        console.log(`      [${domain}] Live: ${liveLinks.length}/${allLinks.length} | Priority: ${getHostPriority(domain)}`);
+
+        domainStats.push({
+          domain,
+          allLinks,
+          liveLinks,
+          deadCount,
+          priority: getHostPriority(domain),
+        });
+      }
+
+      // ── Step 3: Selection logic ────────────────────────────────────────
+      //
+      // Goal: find the single best host that has the most complete set of
+      // parts for the video. Rules in order:
+      //
+      // Rule 1: Prefer hosts where ALL links are alive (no dead parts).
+      // Rule 2: Among complete hosts, pick the one with the most live links.
+      // Rule 3: Tie-break by priority (lower = better / more supported).
+      // Rule 4: If NO host is fully alive, pick the one with the most live
+      //         links regardless, same tie-break.
+      //
+      // This means boodstream (unknown, priority 99) beats vidara (3 parts)
+      // if boodstream has 4 complete alive parts and vidara has 3.
+
+      const withLiveLinks = domainStats.filter(d => d.liveLinks.length > 0);
+
+      if (withLiveLinks.length === 0) {
+        console.log('    [DECISION] All links across all hosts are dead — skipping topic');
+        return [];
+      }
+
+      const completeHosts = withLiveLinks.filter(d => d.deadCount === 0);
+      const pool = completeHosts.length > 0 ? completeHosts : withLiveLinks;
+
+      if (completeHosts.length === 0) {
+        console.log('    [WARN] No host has all parts alive — using best partial match');
+      }
+
+      // Find the maximum live link count in the pool
+      const maxLive = Math.max(...pool.map(d => d.liveLinks.length));
+
+      // All hosts tied at that count
+      const finalists = pool.filter(d => d.liveLinks.length === maxLive);
+
+      // Tie-break: lower priority number wins (known hosts beat unknown)
+      finalists.sort((a, b) => a.priority - b.priority);
 
       const winner = finalists[0];
-      console.log(`    [DECISION] Winner: ${winner.domain} | Working: ${winner.count}/${winner.allLinks.length}`);
+      const isUnknown = winner.priority === 99;
 
-      return winner.validLinks;
+      console.log(
+        `    [DECISION] Winner: ${winner.domain}` +
+        ` | Live: ${winner.liveLinks.length}/${winner.allLinks.length}` +
+        ` | Dead: ${winner.deadCount}` +
+        (isUnknown ? ' | ⚠ Unknown host — scraper will attempt generic extraction' : '')
+      );
+
+      return winner.liveLinks;
     }
   }
 ];

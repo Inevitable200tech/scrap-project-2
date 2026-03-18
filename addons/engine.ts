@@ -80,10 +80,6 @@ class DeadVideoError extends Error {
   }
 }
 
-/**
- * Submit a video URL to the scraper API job queue.
- * Returns the jobId immediately without waiting for processing.
- */
 async function submitJob(videoLink: string, title: string): Promise<string> {
   const response = await axios.post<JobResponse>(API_ENDPOINT, {
     url: videoLink,
@@ -92,15 +88,6 @@ async function submitJob(videoLink: string, title: string): Promise<string> {
   return response.data.jobId;
 }
 
-/**
- * Poll a job until it reaches a terminal state (done / failed).
- * Returns the final job response.
- *
- * Strategy:
- *  - Poll every 5s for the first 2 minutes (fast feedback)
- *  - Then every 15s until timeout
- *  - Hard timeout at 10 minutes
- */
 async function waitForJob(
   jobId: string,
   pollUrlBase: string,
@@ -108,8 +95,8 @@ async function waitForJob(
 ): Promise<JobResponse> {
   const FAST_INTERVAL_MS = 5_000;
   const SLOW_INTERVAL_MS = 15_000;
-  const FAST_PHASE_MS    = 2 * 60 * 1000;  // first 2 minutes
-  const HARD_TIMEOUT_MS  = 10 * 60 * 1000; // 10 minutes total
+  const FAST_PHASE_MS    = 2 * 60 * 1000;
+  const HARD_TIMEOUT_MS  = 10 * 60 * 1000;
 
   const started = Date.now();
   let lastStatus = '';
@@ -130,7 +117,7 @@ async function waitForJob(
       job = res.data;
     } catch (e: any) {
       log(`    [POLL ERR] ${jobId}: ${e.message}`, 'warn');
-      continue; // retry on network hiccup
+      continue;
     }
 
     if (job.status !== lastStatus) {
@@ -148,8 +135,6 @@ async function waitForJob(
     }
 
     if (job.status === 'failed') {
-      // Dead video — no point retrying, throw a typed error so submitAndWait
-      // can skip the retry loop entirely
       if (job.error?.toLowerCase().includes('removed by the uploader') ||
           job.error?.toLowerCase().includes('dead video') ||
           job.error?.toLowerCase().includes('video has been removed') ||
@@ -157,41 +142,32 @@ async function waitForJob(
           job.error?.toLowerCase().includes('http 410')) {
         throw new DeadVideoError(`Dead video: ${job.error}`);
       }
-
-      // Any other failure — let submitAndWait decide whether to retry
       throw new Error(`Job ${jobId} failed: ${job.error}`);
     }
   }
 }
 
-/**
- * Submit a video link to the job queue and wait for the result.
- * Retries submission up to maxAttempts times on transient errors.
- * Dead videos are never retried.
- */
 async function submitAndWait(
   videoLink: string,
   title: string,
   pollUrlBase: string,
   maxAttempts = 3
-): Promise<void> {
+): Promise<'success' | 'dead' | 'failed'> {
   let attempts = 0;
 
   while (attempts < maxAttempts) {
     attempts++;
 
     try {
-      log(`    [SUBMIT] Attempt ${attempts}: ${videoLink}`);
       const jobId = await submitJob(videoLink, title);
       log(`    [JOB:${jobId}] Queued — polling for result...`);
       await waitForJob(jobId, pollUrlBase, videoLink);
-      return; // success
+      return 'success';
 
     } catch (e: any) {
-      // Dead video — skip immediately, no retry
       if (e instanceof DeadVideoError) {
         log(`    [DEAD] ${e.message} — skipping without retry`, 'warn');
-        return;
+        return 'dead';
       }
 
       const isRateLimit = e.response?.status === 429;
@@ -204,9 +180,12 @@ async function submitAndWait(
         await new Promise(r => setTimeout(r, 10_000));
       } else {
         log(`    [FAILED] Giving up on ${videoLink}: ${e.message}`, 'error');
+        return 'failed';
       }
     }
   }
+
+  return 'failed';
 }
 
 // ── Main crawler ───────────────────────────────────────────────────────────
@@ -256,34 +235,57 @@ export async function crawlSite(
 
       const $ = cheerio.load(content);
       const videoLinks = await site.parse($);
-      let newLinksCount = 0;
+
+      // Split into new vs already-seen before processing
+      const newLinks: string[] = [];
       let skippedLinksCount = 0;
-      let deadLinksCount = 0;
 
       for (const videoLink of videoLinks) {
-        const isNewVideo = await state.isNew(videoLink, 'video_host_link');
-
-        if (!isNewVideo) {
+        const isNew = await state.isNew(videoLink, 'video_host_link');
+        if (isNew) {
+          newLinks.push(videoLink);
+        } else {
           skippedLinksCount++;
-          continue;
         }
+      }
 
-        newLinksCount++;
+      const total = newLinks.length;
 
-        // Submit to job queue and wait for terminal status before moving on.
-        // Dead videos return immediately without retrying.
-        await submitAndWait(videoLink, title, pollUrlBase);
+      if (total === 0) {
+        if (skippedLinksCount > 0) {
+          log(`    [STATE] All ${skippedLinksCount} link(s) already seen — skipping topic`);
+        } else {
+          log(`    [EMPTY] No video links found in topic`);
+        }
+        continue;
+      }
 
-        // Brief pause between videos to avoid hammering the scraper API
+      log(`    [QUEUE] ${total} new link(s) to process (${skippedLinksCount} already seen)`);
+
+      // Counters
+      let submitted = 0;
+      let succeeded = 0;
+      let dead      = 0;
+      let failed    = 0;
+
+      for (const videoLink of newLinks) {
+        submitted++;
+        log(`    [PROGRESS] ${submitted}/${total} — submitting: ${videoLink}`);
+
+        const outcome = await submitAndWait(videoLink, title, pollUrlBase);
+
+        if (outcome === 'success') succeeded++;
+        else if (outcome === 'dead') dead++;
+        else failed++;
+
+        log(`    [PROGRESS] ${submitted}/${total} done — ✓ ${succeeded} stored | ✗ ${failed} failed | ⊘ ${dead} dead`);
+
         await new Promise(r => setTimeout(r, 5_000));
       }
 
-      if (newLinksCount > 0) {
-        log(`    [DONE] Submitted ${newLinksCount} new video(s) for ${topicUrl}`);
-      }
-      if (skippedLinksCount > 0) {
-        log(`    [STATE] Ignored ${skippedLinksCount} duplicate video link(s).`);
-      }
+      // Topic summary
+      log(`  [TOPIC DONE] ${topicUrl}`);
+      log(`  [SUMMARY] Total: ${total} | Stored: ${succeeded} | Dead: ${dead} | Failed: ${failed} | Skipped: ${skippedLinksCount}`);
 
     } catch (topicErr: any) {
       log(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`, 'error');
