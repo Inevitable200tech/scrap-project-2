@@ -89,6 +89,7 @@ const DEAD_VIDEO_ERRORS = [
   'video has been removed',
   'http 404',
   'http 410',
+  'This video has been removed due to term violence.'
 ];
 
 function isDeadVideoError(error?: string): boolean {
