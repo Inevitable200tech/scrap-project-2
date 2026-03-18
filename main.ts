@@ -2,7 +2,7 @@
 import express from 'express';
 import { SITES, CHECK_INTERVAL_MS, API_ENDPOINT } from './addons/config';
 import { StateManager } from './addons/state';
-import { crawlSite } from './addons/engine';
+import { crawlSite, tickJobTracker, activeJobs } from './addons/engine';
 import dotenv from 'dotenv';
 
 dotenv.config({ path: 'cert.env' });
@@ -13,8 +13,6 @@ const PORT = 823;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://...';
 const state = new StateManager(MONGO_URI);
 
-// Extract the base URL from API_ENDPOINT for polling
-// e.g. "http://scraper:3500/api/scrape" → "http://scraper:3500"
 const POLL_URL_BASE = (() => {
   try {
     const u = new URL(API_ENDPOINT);
@@ -70,11 +68,23 @@ app.get('/api/status', async (req, res) => {
     interval: CHECK_INTERVAL_MS,
     database: stats,
     pollUrlBase: POLL_URL_BASE,
+    activeJobs: activeJobs.size,
     memory: {
       rss: `${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`,
       heapUsed: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
     },
   });
+});
+
+// Show all currently tracked jobs
+app.get('/api/jobs', (req, res) => {
+  res.json(Array.from(activeJobs.values()).map(j => ({
+    jobId: j.jobId,
+    videoLink: j.videoLink,
+    attempts: j.attempts,
+    status: j.status,
+    runningFor: `${Math.round((Date.now() - j.submittedAt) / 1000)}s`,
+  })));
 });
 
 app.get('/health', (req, res) => {
@@ -87,7 +97,20 @@ app.listen(PORT, async () => {
   try {
     await state.connect();
     await runMonitor();
+
+    // ── Crawl cycle — runs every CHECK_INTERVAL_MS ─────────────────────
     setInterval(runMonitor, CHECK_INTERVAL_MS);
+
+    // ── Job tracker — runs every 30s independently of crawl cycle ──────
+    // Checks status of all submitted jobs and retries failed ones.
+    setInterval(async () => {
+      try {
+        await tickJobTracker();
+      } catch (err) {
+        console.error('[TRACKER ERROR]', err);
+      }
+    }, 30_000);
+
   } catch (err) {
     console.error('FATAL: Could not initialize database. Process exiting.');
     process.exit(1);

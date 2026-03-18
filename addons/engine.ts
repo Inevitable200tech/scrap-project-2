@@ -71,13 +71,30 @@ interface JobResponse {
   error?: string;
 }
 
-// Thrown when a job fails because the video is confirmed dead at the source.
-// Caught in submitAndWait to skip retries entirely.
-class DeadVideoError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'DeadVideoError';
-  }
+// Tracks a submitted job and its retry state
+interface TrackedJob {
+  jobId: string;
+  videoLink: string;
+  title: string;
+  pollUrlBase: string;
+  attempts: number;
+  maxAttempts: number;
+  submittedAt: number;
+  status: 'running' | 'done' | 'dead' | 'failed';
+}
+
+const DEAD_VIDEO_ERRORS = [
+  'removed by the uploader',
+  'dead video',
+  'video has been removed',
+  'http 404',
+  'http 410',
+];
+
+function isDeadVideoError(error?: string): boolean {
+  if (!error) return false;
+  const lower = error.toLowerCase();
+  return DEAD_VIDEO_ERRORS.some(e => lower.includes(e));
 }
 
 async function submitJob(videoLink: string, title: string): Promise<string> {
@@ -88,104 +105,122 @@ async function submitJob(videoLink: string, title: string): Promise<string> {
   return response.data.jobId;
 }
 
-async function waitForJob(
-  jobId: string,
-  pollUrlBase: string,
-  videoLink: string
-): Promise<JobResponse> {
-  const FAST_INTERVAL_MS = 5_000;
-  const SLOW_INTERVAL_MS = 15_000;
-  const FAST_PHASE_MS    = 2 * 60 * 1000;
-  const HARD_TIMEOUT_MS  = 10 * 60 * 1000;
-
-  const started = Date.now();
-  let lastStatus = '';
-
-  while (true) {
-    const elapsed = Date.now() - started;
-
-    if (elapsed > HARD_TIMEOUT_MS) {
-      throw new Error(`Job ${jobId} timed out after 10 minutes`);
-    }
-
-    const pollInterval = elapsed < FAST_PHASE_MS ? FAST_INTERVAL_MS : SLOW_INTERVAL_MS;
-    await new Promise(r => setTimeout(r, pollInterval));
-
-    let job: JobResponse;
-    try {
-      const res = await axios.get<JobResponse>(`${pollUrlBase}/api/scrape/status/${jobId}`);
-      job = res.data;
-    } catch (e: any) {
-      log(`    [POLL ERR] ${jobId}: ${e.message}`, 'warn');
-      continue;
-    }
-
-    if (job.status !== lastStatus) {
-      log(`    [JOB:${jobId}] Status → ${job.status}`);
-      lastStatus = job.status;
-    }
-
-    if (job.status === 'done') {
-      if (job.result?.isDuplicate) {
-        log(`    [JOB:${jobId}] Duplicate — already stored`);
-      } else {
-        log(`    [JOB:${jobId}] ✓ Stored → R2: ${job.result?.r2Key}`);
-      }
-      return job;
-    }
-
-    if (job.status === 'failed') {
-      if (job.error?.toLowerCase().includes('removed by the uploader') ||
-          job.error?.toLowerCase().includes('dead video') ||
-          job.error?.toLowerCase().includes('video has been removed') ||
-          job.error?.toLowerCase().includes('http 404') ||
-          job.error?.toLowerCase().includes('http 410')) {
-        throw new DeadVideoError(`Dead video: ${job.error}`);
-      }
-      throw new Error(`Job ${jobId} failed: ${job.error}`);
-    }
-  }
+async function checkJobStatus(jobId: string, pollUrlBase: string): Promise<JobResponse> {
+  const res = await axios.get<JobResponse>(`${pollUrlBase}/api/scrape/status/${jobId}`);
+  return res.data;
 }
 
-async function submitAndWait(
+// ── Global job tracker ─────────────────────────────────────────────────────
+// Jobs are added here when submitted and removed when terminal.
+// The background checker in main.ts polls these periodically.
+export const activeJobs = new Map<string, TrackedJob>();
+
+/**
+ * Submit a video link to the job queue and track it.
+ * Returns immediately — does NOT wait for the job to finish.
+ */
+export async function submitAndTrack(
   videoLink: string,
   title: string,
   pollUrlBase: string,
   maxAttempts = 3
-): Promise<'success' | 'dead' | 'failed'> {
-  let attempts = 0;
+): Promise<void> {
+  try {
+    const jobId = await submitJob(videoLink, title);
+    log(`    [SUBMITTED] ${jobId} → ${videoLink}`);
 
-  while (attempts < maxAttempts) {
-    attempts++;
+    activeJobs.set(jobId, {
+      jobId,
+      videoLink,
+      title,
+      pollUrlBase,
+      attempts: 1,
+      maxAttempts,
+      submittedAt: Date.now(),
+      status: 'running',
+    });
+  } catch (e: any) {
+    log(`    [SUBMIT ERR] ${videoLink}: ${e.message}`, 'error');
+  }
+}
 
+/**
+ * Check all active jobs once and update their status.
+ * Called periodically by the monitor in main.ts.
+ * Re-submits failed jobs up to maxAttempts.
+ */
+export async function tickJobTracker(): Promise<void> {
+  if (activeJobs.size === 0) return;
+
+  log(`[TRACKER] Checking ${activeJobs.size} active job(s)...`);
+
+  for (const [jobId, tracked] of activeJobs.entries()) {
+    // Hard timeout — 15 minutes per job
+    const elapsed = Date.now() - tracked.submittedAt;
+    if (elapsed > 15 * 60 * 1000) {
+      log(`[TRACKER] Job ${jobId} timed out (15min) — giving up`, 'warn');
+      activeJobs.delete(jobId);
+      continue;
+    }
+
+    let job: JobResponse;
     try {
-      const jobId = await submitJob(videoLink, title);
-      log(`    [JOB:${jobId}] Queued — polling for result...`);
-      await waitForJob(jobId, pollUrlBase, videoLink);
-      return 'success';
-
+      job = await checkJobStatus(jobId, tracked.pollUrlBase);
     } catch (e: any) {
-      if (e instanceof DeadVideoError) {
-        log(`    [DEAD] ${e.message} — skipping without retry`, 'warn');
-        return 'dead';
+      log(`[TRACKER] Poll error for ${jobId}: ${e.message}`, 'warn');
+      continue; // retry next tick
+    }
+
+    log(`[TRACKER] ${jobId} → ${job.status}`);
+
+    if (job.status === 'done') {
+      if (job.result?.isDuplicate) {
+        log(`[TRACKER] ${jobId} ✓ Duplicate — already stored`);
+      } else {
+        log(`[TRACKER] ${jobId} ✓ Stored → R2: ${job.result?.r2Key}`);
+      }
+      activeJobs.delete(jobId);
+      continue;
+    }
+
+    if (job.status === 'failed') {
+      if (isDeadVideoError(job.error)) {
+        log(`[TRACKER] ${jobId} ⊘ Dead video — ${job.error}`, 'warn');
+        activeJobs.delete(jobId);
+        continue;
       }
 
-      const isRateLimit = e.response?.status === 429;
+      // Transient failure — retry if attempts remaining
+      if (tracked.attempts < tracked.maxAttempts) {
+        log(`[TRACKER] ${jobId} ✗ Failed (attempt ${tracked.attempts}/${tracked.maxAttempts}) — resubmitting: ${tracked.videoLink}`, 'warn');
+        try {
+          const newJobId = await submitJob(tracked.videoLink, tracked.title);
+          log(`[TRACKER] Resubmitted as ${newJobId}`);
 
-      if (isRateLimit && attempts < maxAttempts) {
-        log(`    [RATE LIMIT] Waiting 15s (attempt ${attempts})...`, 'warn');
-        await new Promise(r => setTimeout(r, 15_000));
-      } else if (attempts < maxAttempts) {
-        log(`    [RETRY] ${e.message} — retrying in 10s (attempt ${attempts})`, 'warn');
-        await new Promise(r => setTimeout(r, 10_000));
+          // Replace old job entry with new one
+          activeJobs.delete(jobId);
+          activeJobs.set(newJobId, {
+            ...tracked,
+            jobId: newJobId,
+            attempts: tracked.attempts + 1,
+            submittedAt: Date.now(),
+            status: 'running',
+          });
+        } catch (e: any) {
+          log(`[TRACKER] Resubmit failed for ${tracked.videoLink}: ${e.message}`, 'error');
+          activeJobs.delete(jobId);
+        }
       } else {
-        log(`    [FAILED] Giving up on ${videoLink}: ${e.message}`, 'error');
-        return 'failed';
+        log(`[TRACKER] ${jobId} ✗ Giving up after ${tracked.attempts} attempts: ${tracked.videoLink}`, 'error');
+        activeJobs.delete(jobId);
       }
     }
+    // pending / scraping / storing — still running, check next tick
   }
 
-  return 'failed';
+  if (activeJobs.size > 0) {
+    log(`[TRACKER] ${activeJobs.size} job(s) still running`);
+  }
 }
 
 // ── Main crawler ───────────────────────────────────────────────────────────
@@ -221,6 +256,8 @@ export async function crawlSite(
     return;
   }
 
+  let totalSubmitted = 0;
+
   for (const topicUrl of uniqueTopics) {
     const isNewTopic = await state.isNew(topicUrl, 'topic_visited');
 
@@ -236,7 +273,6 @@ export async function crawlSite(
       const $ = cheerio.load(content);
       const videoLinks = await site.parse($);
 
-      // Split into new vs already-seen before processing
       const newLinks: string[] = [];
       let skippedLinksCount = 0;
 
@@ -260,32 +296,19 @@ export async function crawlSite(
         continue;
       }
 
-      log(`    [QUEUE] ${total} new link(s) to process (${skippedLinksCount} already seen)`);
+      log(`    [QUEUE] Submitting ${total} new link(s) (${skippedLinksCount} already seen)`);
 
-      // Counters
-      let submitted = 0;
-      let succeeded = 0;
-      let dead      = 0;
-      let failed    = 0;
-
-      for (const videoLink of newLinks) {
-        submitted++;
-        log(`    [PROGRESS] ${submitted}/${total} — submitting: ${videoLink}`);
-
-        const outcome = await submitAndWait(videoLink, title, pollUrlBase);
-
-        if (outcome === 'success') succeeded++;
-        else if (outcome === 'dead') dead++;
-        else failed++;
-
-        log(`    [PROGRESS] ${submitted}/${total} done — ✓ ${succeeded} stored | ✗ ${failed} failed | ⊘ ${dead} dead`);
-
-        await new Promise(r => setTimeout(r, 5_000));
+      for (let i = 0; i < newLinks.length; i++) {
+        const videoLink = newLinks[i];
+        log(`    [SUBMIT] ${i + 1}/${total} → ${videoLink}`);
+        // Fire and forget — job is tracked in activeJobs
+        await submitAndTrack(videoLink, title, pollUrlBase);
+        // Small delay between submissions to avoid flooding the API
+        await new Promise(r => setTimeout(r, 1_000));
       }
 
-      // Topic summary
-      log(`  [TOPIC DONE] ${topicUrl}`);
-      log(`  [SUMMARY] Total: ${total} | Stored: ${succeeded} | Dead: ${dead} | Failed: ${failed} | Skipped: ${skippedLinksCount}`);
+      totalSubmitted += total;
+      log(`    [TOPIC DONE] Submitted ${total} job(s) for: ${topicUrl}`);
 
     } catch (topicErr: any) {
       log(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`, 'error');
@@ -295,5 +318,5 @@ export async function crawlSite(
   if (skippedTopics > 0) {
     log(`[STATE] Ignored ${skippedTopics} topics (already in database).`);
   }
-  log(`[FINISHED] Cycle complete for ${site.name}.`);
+  log(`[FINISHED] Cycle complete for ${site.name} — ${totalSubmitted} job(s) submitted, ${activeJobs.size} total active`);
 }
