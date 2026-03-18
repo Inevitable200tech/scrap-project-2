@@ -1,3 +1,4 @@
+// engine.ts
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
@@ -7,9 +8,6 @@ import { StateManager } from './state';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
-/**
- * Helper to prefix every log with a high-precision timestamp
- */
 function log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
   const timestamp = new Date().toLocaleTimeString('en-GB', { hour12: false });
   const line = `[${timestamp}] ${message}`;
@@ -29,42 +27,177 @@ const BROWSER_ARGS = [
 ];
 
 async function getPageData(url: string, referer?: string) {
-  const browser = await playwrightExtra.chromium.launch({ 
-    headless: true, 
-    args: BROWSER_ARGS 
+  const browser = await playwrightExtra.chromium.launch({
+    headless: true,
+    args: BROWSER_ARGS
   });
-  
+
   try {
     const context = await browser.newContext({
       extraHTTPHeaders: referer ? { 'Referer': referer } : {}
     });
     const page = await context.newPage();
-    
+
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      return ['image', 'stylesheet', 'font', 'media'].includes(type) ? route.abort() : route.continue();
+      return ['image', 'stylesheet', 'font', 'media'].includes(type)
+        ? route.abort()
+        : route.continue();
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     const content = await page.content();
     const title = await page.title();
-    
+
     return { content, title };
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
-export async function crawlSite(site: SiteConfig, state: StateManager) {
+// ── Job queue client ───────────────────────────────────────────────────────
+
+interface JobResponse {
+  jobId: string;
+  status: 'pending' | 'scraping' | 'storing' | 'done' | 'failed';
+  pollUrl: string;
+  result?: {
+    title: string;
+    r2Key?: string;
+    hash?: string;
+    isDuplicate?: boolean;
+    playUrl?: string;
+  };
+  error?: string;
+}
+
+/**
+ * Submit a video URL to the scraper API job queue.
+ * Returns the jobId immediately without waiting for processing.
+ */
+async function submitJob(videoLink: string, title: string): Promise<string> {
+  const response = await axios.post<JobResponse>(API_ENDPOINT, {
+    url: videoLink,
+    title,
+  });
+  return response.data.jobId;
+}
+
+/**
+ * Poll a job until it reaches a terminal state (done / failed).
+ * Returns the final job response.
+ *
+ * Strategy:
+ *  - Poll every 5s for the first 2 minutes (fast feedback)
+ *  - Then every 15s until timeout
+ *  - Hard timeout at 10 minutes
+ */
+async function waitForJob(
+  jobId: string,
+  pollUrlBase: string,
+  videoLink: string
+): Promise<JobResponse> {
+  const FAST_INTERVAL_MS  = 5_000;
+  const SLOW_INTERVAL_MS  = 15_000;
+  const FAST_PHASE_MS     = 2 * 60 * 1000;   // first 2 minutes
+  const HARD_TIMEOUT_MS   = 10 * 60 * 1000;  // 10 minutes total
+
+  const started = Date.now();
+  let lastStatus = '';
+
+  while (true) {
+    const elapsed = Date.now() - started;
+
+    if (elapsed > HARD_TIMEOUT_MS) {
+      throw new Error(`Job ${jobId} timed out after 10 minutes`);
+    }
+
+    const pollInterval = elapsed < FAST_PHASE_MS ? FAST_INTERVAL_MS : SLOW_INTERVAL_MS;
+    await new Promise(r => setTimeout(r, pollInterval));
+
+    let job: JobResponse;
+    try {
+      const res = await axios.get<JobResponse>(`${pollUrlBase}/api/scrape/status/${jobId}`);
+      job = res.data;
+    } catch (e: any) {
+      log(`    [POLL ERR] ${jobId}: ${e.message}`, 'warn');
+      continue; // retry on network hiccup
+    }
+
+    if (job.status !== lastStatus) {
+      log(`    [JOB:${jobId}] Status → ${job.status}`);
+      lastStatus = job.status;
+    }
+
+    if (job.status === 'done') {
+      if (job.result?.isDuplicate) {
+        log(`    [JOB:${jobId}] Duplicate — already stored`);
+      } else {
+        log(`    [JOB:${jobId}] ✓ Stored → R2: ${job.result?.r2Key}`);
+      }
+      return job;
+    }
+
+    if (job.status === 'failed') {
+      throw new Error(`Job ${jobId} failed: ${job.error}`);
+    }
+  }
+}
+
+/**
+ * Submit a video link to the job queue and wait for the result.
+ * Retries submission up to maxAttempts times on transient errors.
+ */
+async function submitAndWait(
+  videoLink: string,
+  title: string,
+  pollUrlBase: string,
+  maxAttempts = 3
+): Promise<void> {
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+
+    try {
+      log(`    [SUBMIT] Attempt ${attempts}: ${videoLink}`);
+      const jobId = await submitJob(videoLink, title);
+      log(`    [JOB:${jobId}] Queued — polling for result...`);
+      await waitForJob(jobId, pollUrlBase, videoLink);
+      return; // success
+
+    } catch (e: any) {
+      const isRateLimit = e.response?.status === 429;
+
+      if (isRateLimit && attempts < maxAttempts) {
+        log(`    [RATE LIMIT] Waiting 15s (attempt ${attempts})...`, 'warn');
+        await new Promise(r => setTimeout(r, 15_000));
+      } else if (attempts < maxAttempts) {
+        log(`    [RETRY] ${e.message} — retrying in 10s (attempt ${attempts})`, 'warn');
+        await new Promise(r => setTimeout(r, 10_000));
+      } else {
+        log(`    [FAILED] Giving up on ${videoLink}: ${e.message}`, 'error');
+      }
+    }
+  }
+}
+
+// ── Main crawler ───────────────────────────────────────────────────────────
+
+export async function crawlSite(
+  site: SiteConfig,
+  state: StateManager,
+  pollUrlBase: string
+) {
   log(`[INDEX] Scanning: ${site.url}`);
-  
+
   let uniqueTopics: string[] = [];
   let skippedTopics = 0;
 
   try {
     const indexData = await getPageData(site.url);
     const $index = cheerio.load(indexData.content);
-    
+
     const rawUrls: string[] = [];
     $index(site.topicSelector).each((_, el) => {
       const href = $index(el).attr('href');
@@ -73,7 +206,7 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
 
     uniqueTopics = [...new Set(rawUrls)]
       .filter(url => url.includes('/topic/') && !url.includes('/tags/'))
-      .slice(0, 25); 
+      .slice(0, 25);
 
     log(`[INDEX] Found ${uniqueTopics.length} potential topics.`);
 
@@ -83,8 +216,8 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
   }
 
   for (const topicUrl of uniqueTopics) {
-    const isNewTopic = await state.isNew(topicUrl, "topic_visited");
-    
+    const isNewTopic = await state.isNew(topicUrl, 'topic_visited');
+
     if (!isNewTopic) {
       skippedTopics++;
       continue;
@@ -93,28 +226,38 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
     try {
       log(`  [NEW TOPIC] ${topicUrl}`);
       const { content, title } = await getPageData(topicUrl, site.url);
-      
+
       const $ = cheerio.load(content);
       const videoLinks = await site.parse($);
       let newLinksCount = 0;
       let skippedLinksCount = 0;
 
       for (const videoLink of videoLinks) {
-        const isNewVideo = await state.isNew(videoLink, "video_host_link");
-        if (isNewVideo) {
-          newLinksCount++;
-          log(`    [SENDING] → ${videoLink}`);
-          await sendToApiWithRetry(videoLink, site.name, topicUrl, title);
-          await new Promise(r => setTimeout(r, 25000)); //Increase the timeout for each video link to 25 seconds to reduce the risk of hitting rate limits
-        } else {
+        const isNewVideo = await state.isNew(videoLink, 'video_host_link');
+
+        if (!isNewVideo) {
           skippedLinksCount++;
+          continue;
         }
+
+        newLinksCount++;
+
+        // Submit to job queue and wait for terminal status before moving on.
+        // This ensures we don't flood the scraper API and we know the outcome
+        // of each video before processing the next one.
+        await submitAndWait(videoLink, title, pollUrlBase);
+
+        // Brief pause between videos to avoid hammering the scraper API
+        await new Promise(r => setTimeout(r, 5_000));
       }
 
-      if (skippedLinksCount > 0) {
-        log(`    [STATE] Ignored ${skippedLinksCount} duplicate video links.`);
+      if (newLinksCount > 0) {
+        log(`    [DONE] Submitted ${newLinksCount} new video(s) for ${topicUrl}`);
       }
-      
+      if (skippedLinksCount > 0) {
+        log(`    [STATE] Ignored ${skippedLinksCount} duplicate video link(s).`);
+      }
+
     } catch (topicErr: any) {
       log(`  [SKIP] Error on topic ${topicUrl}: ${topicErr.message}`, 'error');
     }
@@ -124,38 +267,4 @@ export async function crawlSite(site: SiteConfig, state: StateManager) {
     log(`[STATE] Ignored ${skippedTopics} topics (already in database).`);
   }
   log(`[FINISHED] Cycle complete for ${site.name}.`);
-}
-
-async function sendToApiWithRetry(videoLink: string, siteName: string, topicUrl: string, title: string) {
-  let sent = false;
-  let attempts = 0;
-  const maxAttempts = 3;
-
-  while (!sent && attempts < maxAttempts) {
-
-    try {
-      const response = await axios.post(API_ENDPOINT, {
-        url: videoLink,
-        source: siteName,
-        parentTopic: topicUrl,
-        topicTitle: title
-      });
-
-      if (response.status === 200 || response.status === 201) {
-        log(`    [SUCCESS] Delivered: ${videoLink}`);
-        sent = true;
-      }
-    } catch (e: any) {
-      attempts++;
-      const isRateLimit = e.response?.status === 202 || e.response?.status === 429;
-
-      if (isRateLimit && attempts < maxAttempts) {
-        log(`    [RATE LIMIT] Waiting 10s (Attempt ${attempts})...`, 'warn');
-        await new Promise(r => setTimeout(r, 10000));
-      } else {
-        log(`    [API ERR] Failed ${videoLink}: ${e.message}`, 'error');
-        break; 
-      }
-    }
-  }
 }
