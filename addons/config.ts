@@ -25,7 +25,7 @@ function getHostPriority(domain: string): number {
 }
 
 // ── Domains to ignore entirely ─────────────────────────────────────────────
-const IGNORED_DOMAINS = /luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload|twitter|reddit|linkedin|pinterest|facebook/i;
+const IGNORED_DOMAINS = /luluvid|dropmms|pixhost|postimg|imagetwist|flash-files|krakenfiles|upfiles|frdl\.io|torupload|file-upload|twitter|reddit|linkedin|pinterest|img|facebook/i;
 
 // ── Quick dead check ───────────────────────────────────────────────────────
 async function isDefinitelyDead(url: string): Promise<boolean> {
