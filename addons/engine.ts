@@ -23,9 +23,8 @@ const BROWSER_ARGS = [
   '--disable-dev-shm-usage',
   '--disable-accelerated-2d-canvas',
   '--no-zygote',
-  '--single-process',
   '--disable-gpu',
-  '--js-flags="--max-old-space-size=128"'
+  '--js-flags="--max-old-space-size=256"'
 ];
 
 let globalBrowser: any = null;
