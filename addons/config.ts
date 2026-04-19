@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { page_crawl } from '../main';
 
 export const API_ENDPOINT = 'https://scrap-project-1-j2sd.onrender.com/api/scrape';
 export const CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -56,7 +57,7 @@ export const SITES: SiteConfig[] = [
     // When ready to go deeper, increase this number.
     // The forum has 1079 pages × 24 topics = ~25,896 topics total.
     // Suggested progression: 1 → 5 → 25 → 100 as backlog is processed.
-    pagesToCrawl: 1,
+    pagesToCrawl: page_crawl,
 
     topicSelector: 'a[href*="/topic/"]',
     videoLinkSelector: '.cPost_contentWrap a[href]',

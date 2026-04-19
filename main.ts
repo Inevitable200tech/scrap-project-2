@@ -9,7 +9,7 @@ dotenv.config({ path: 'cert.env' });
 
 const app = express();
 const PORT = 823;
-
+export const page_crawl = Number(process.env.PAGE_CRAWL || 1);
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://...';
 const state = new StateManager(MONGO_URI);
 
