@@ -30,6 +30,10 @@ function logMemory() {
   if (rss > 425) {
     console.warn(`[!] CRITICAL: Memory usage is dangerously high (${rss}MB/425MB)`);
   }
+  if (rss >= 450) {
+    console.error(`[!] FATAL: Memory usage reached 450MB or above (${rss}MB). Exiting process to enforce limit.`);
+    process.exit(1);
+  }
 }
 
 async function runMonitor() {

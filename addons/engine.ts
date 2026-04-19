@@ -24,27 +24,49 @@ const BROWSER_ARGS = [
   '--disable-accelerated-2d-canvas',
   '--no-zygote',
   '--single-process',
-  '--disable-gpu'
+  '--disable-gpu',
+  '--js-flags="--max-old-space-size=128"'
 ];
 
-async function getPageData(url: string, referer?: string) {
-  const browser = await playwrightExtra.chromium.launch({
-    headless: true,
-    args: BROWSER_ARGS
-  });
+let globalBrowser: any = null;
+let globalBlocker: PlaywrightBlocker | null = null;
 
+async function getBrowser() {
+  if (!globalBrowser || !globalBrowser.isConnected()) {
+    log('[BROWSER] Launching new persistent browser instance...');
+    globalBrowser = await playwrightExtra.chromium.launch({
+      headless: true,
+      args: BROWSER_ARGS
+    });
+  }
+  return globalBrowser;
+}
+
+// Ensure the browser closes if the Node process exits
+process.on('exit', () => {
+  if (globalBrowser) globalBrowser.close().catch(() => { });
+});
+
+async function getPageData(url: string, referer?: string) {
+  const browser = await getBrowser();
+  let context: any;
   try {
-    const context = await browser.newContext({
+    context = await browser.newContext({
       extraHTTPHeaders: referer ? { 'Referer': referer } : {}
     });
     const page = await context.newPage();
 
-    const blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch);
-    await blocker.enableBlockingInPage(page);
+    // Cache the blocker so we don't redownload/re-parse lists on every page load
+    if (!globalBlocker) {
+      globalBlocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch);
+    }
+    await globalBlocker.enableBlockingInPage(page);
 
-    await page.route('**/*', (route) => {
+    await page.route('**/*', (route: { request: () => { (): any; new(): any; resourceType: { (): any; new(): any; }; }; abort: () => any; continue: () => any; }) => {
       const type = route.request().resourceType();
-      return ['image', 'stylesheet', 'font', 'media'].includes(type)
+      // Only allow essential types for Cloudflare stealth to pass
+      const blockedTypes = ['image', 'stylesheet', 'font', 'media', 'websocket', 'manifest', 'texttrack', 'object', 'beacon', 'csp_report'];
+      return blockedTypes.includes(type)
         ? route.abort()
         : route.continue();
     });
@@ -54,8 +76,15 @@ async function getPageData(url: string, referer?: string) {
     const title = await page.title();
 
     return { content, title };
+  } catch (err: any) {
+    if (globalBrowser && !globalBrowser.isConnected()) {
+      globalBrowser = null;
+    }
+    throw err;
   } finally {
-    await browser.close().catch(() => {});
+    if (context) {
+      await context.close().catch(() => { });
+    }
   }
 }
 
@@ -162,7 +191,7 @@ export async function tickJobTracker(): Promise<void> {
   for (const [jobId, tracked] of activeJobs.entries()) {
     // Hard timeout — 1 Hrs  per job
     const elapsed = Date.now() - tracked.submittedAt;
-    if (elapsed >  60 * 60 * 1000) {
+    if (elapsed > 60 * 60 * 1000) {
       log(`[TRACKER] Job ${jobId} timed out (1hr) — giving up`, 'warn');
       activeJobs.delete(jobId);
       continue;
