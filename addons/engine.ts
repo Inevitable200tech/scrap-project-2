@@ -5,6 +5,7 @@ import * as cheerio from 'cheerio';
 import axios from 'axios';
 import { SiteConfig, API_ENDPOINT } from './config';
 import { StateManager } from './state';
+import { PlaywrightBlocker } from '@ghostery/adblocker-playwright';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
@@ -37,6 +38,9 @@ async function getPageData(url: string, referer?: string) {
       extraHTTPHeaders: referer ? { 'Referer': referer } : {}
     });
     const page = await context.newPage();
+
+    const blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch);
+    await blocker.enableBlockingInPage(page);
 
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();

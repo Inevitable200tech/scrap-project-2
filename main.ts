@@ -27,8 +27,8 @@ function logMemory() {
   const rss = Math.round(used.rss / 1024 / 1024);
   const heap = Math.round(used.heapUsed / 1024 / 1024);
   console.log(`[MEMORY] RSS: ${rss}MB | Heap Used: ${heap}MB`);
-  if (rss > 450) {
-    console.warn(`[!] CRITICAL: Memory usage is dangerously high (${rss}MB/512MB)`);
+  if (rss > 425) {
+    console.warn(`[!] CRITICAL: Memory usage is dangerously high (${rss}MB/425MB)`);
   }
 }
 
