@@ -52,8 +52,8 @@ async function isDefinitelyDead(url: string): Promise<boolean> {
 
 export const SITES: SiteConfig[] = [
   {
-    name: 'dropmms',
-    url: 'https://dropmms.co/forum/2-desi-new-videoz-hd-sd/',
+    name: process.env.SITE_NAME || 'Example Forum',
+    url: process.env.MAIN_URL || '',
 
     // ── Pagination control ─────────────────────────────────────────────
     // Set to 1 for front page only.
