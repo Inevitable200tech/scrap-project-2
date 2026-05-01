@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config({ path: 'cert.env' });
 
 const page_crawl = Number(process.env.PAGE_CRAWL || 1);
-export const API_ENDPOINT = 'https://scrap-project-1-j2sd.onrender.com/api/scrape';
+export const API_ENDPOINT = `${process.env.API_BASE_URL || 'https://example.com'}/api/scrape`;
 export const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface SiteConfig {
